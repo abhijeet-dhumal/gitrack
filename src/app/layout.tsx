@@ -1,7 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { AiModeProvider } from "@/components/AiModeContext";
-import { MetricsProvider } from "@/components/MetricsContext";
 import { ThemeProvider } from "@/components/ThemeContext";
 import { AuthProvider } from "@/components/AuthContext";
 
@@ -21,9 +20,7 @@ export default function RootLayout({
         <AuthProvider>
           <ThemeProvider>
             <AiModeProvider>
-              <MetricsProvider>
-                <div className="mx-auto flex max-w-6xl flex-col gap-6 px-4 py-8">{children}</div>
-              </MetricsProvider>
+              <div className="mx-auto flex max-w-6xl flex-col gap-6 px-4 py-8">{children}</div>
             </AiModeProvider>
           </ThemeProvider>
         </AuthProvider>

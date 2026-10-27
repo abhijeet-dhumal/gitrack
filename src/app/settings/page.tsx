@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "@/components/AuthContext";
-import { loadLlmSettings, saveLlmSettings, clearLlmSettings, loadReviewCommentHeading, saveReviewCommentHeading, type LlmSettings } from "@/lib/client-settings";
+import { activateProviderProfile, readProviderProfiles, saveProviderProfiles, clearLlmSettings, loadReviewCommentHeading, saveReviewCommentHeading, loadGithubMcpReviewContext, saveGithubMcpReviewContext, type LlmProvider, type ProviderProfile } from "@/lib/client-settings";
 import Link from "next/link";
 
 type FieldConfig = {
@@ -15,7 +15,6 @@ type FieldConfig = {
 };
 
 const FIELDS: FieldConfig[] = [
-    { key: "llm_provider", label: "LLM Provider", placeholder: "anthropic | groq | ollama | openai | vertex | vllm", sensitive: false },
     { key: "anthropic_api_key", label: "Anthropic API Key", placeholder: "sk-ant-...", sensitive: true, provider: "anthropic" },
     { key: "anthropic_model", label: "Anthropic Model", placeholder: "claude-3-5-sonnet-20241022", sensitive: false, provider: "anthropic" },
     { key: "groq_api_key", label: "Groq API Key", placeholder: "gsk_...", sensitive: true, provider: "groq" },
@@ -32,6 +31,15 @@ const FIELDS: FieldConfig[] = [
     { key: "vllm_model", label: "vLLM Model", placeholder: "Model name served by vLLM", sensitive: false, provider: "vllm" },
     { key: "vllm_api_key", label: "vLLM API Key (optional)", placeholder: "API key if auth is enabled", sensitive: true, provider: "vllm" },
 ];
+
+const PROVIDERS = [
+    { value: "anthropic", label: "Anthropic", required: ["anthropic_api_key"] },
+    { value: "groq", label: "Groq", required: ["groq_api_key"] },
+    { value: "ollama", label: "Ollama", required: ["ollama_host"] },
+    { value: "openai", label: "OpenAI", required: ["openai_api_key"] },
+    { value: "vertex", label: "Vertex AI", required: ["vertex_project_id", "vertex_sa_key"] },
+    { value: "vllm", label: "vLLM", required: ["vllm_host"] },
+] as const;
 
 const PR_SIZES = ["XS", "S", "M", "L", "XL", "XXL"] as const;
 type PrSizeLabel = (typeof PR_SIZES)[number];
@@ -409,19 +417,22 @@ function RuleCard({
 export default function SettingsPage() {
     const { user, loading: authLoading } = useAuth();
 
-    const [form, setForm] = useState<Record<string, string>>({});
-    const [savedValues, setSavedValues] = useState<Record<string, string>>({});
+    const [profiles, setProfiles] = useState<ProviderProfile[]>([]);
+    const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
+    const [editingProfileId, setEditingProfileId] = useState<string | null>(null);
+    const [draftName, setDraftName] = useState("");
+    const [draftProvider, setDraftProvider] = useState<LlmProvider | "">("");
+    const [draftValues, setDraftValues] = useState<Record<string, string>>({});
     const [loading, setLoading] = useState(true);
     const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
     const [includeCommentHeading, setIncludeCommentHeading] = useState(true);
+    const [githubMcpReviewContext, setGithubMcpReviewContext] = useState(false);
 
     const reloadFromStorage = useCallback(() => {
-        const stored = loadLlmSettings();
-        const asRecord: Record<string, string> = {};
-        for (const [k, v] of Object.entries(stored)) {
-            if (typeof v === "string" && v) asRecord[k] = v;
-        }
-        setSavedValues(asRecord);
+        const { value, error } = readProviderProfiles();
+        setProfiles(value.profiles);
+        setActiveProfileId(value.activeProfileId);
+        setMessage(error ? { type: "error", text: error } : null);
         setLoading(false);
     }, []);
 
@@ -429,27 +440,105 @@ export default function SettingsPage() {
         if (!authLoading) {
             reloadFromStorage();
             setIncludeCommentHeading(loadReviewCommentHeading());
+            setGithubMcpReviewContext(loadGithubMcpReviewContext());
         }
     }, [authLoading, reloadFromStorage]);
 
-    const handleSave = () => {
+    const handleAddProfile = () => {
+        setEditingProfileId("new");
+        setDraftName("");
+        setDraftProvider("");
+        setDraftValues({});
         setMessage(null);
-        const merged = { ...savedValues } as Record<string, string>;
-        for (const [k, v] of Object.entries(form)) {
-            if (v.trim()) merged[k] = v.trim();
+    };
+
+    const handleEditProfile = (profile: ProviderProfile) => {
+        setEditingProfileId(profile.id);
+        setDraftName(profile.name);
+        setDraftProvider(profile.provider);
+        const editableValues = { ...profile.settings } as Record<string, string>;
+        for (const field of FIELDS) if (field.sensitive) delete editableValues[field.key];
+        setDraftValues(editableValues);
+        setMessage(null);
+    };
+
+    const handleSaveProfile = () => {
+        if (!draftProvider) {
+            setMessage({ type: "error", text: "Choose a provider type for this profile." });
+            return;
         }
-        saveLlmSettings(merged as LlmSettings);
-        setForm({});
-        reloadFromStorage();
-        setMessage({ type: "success", text: "Settings saved to your browser." });
+        const existing = profiles.find((profile) => profile.id === editingProfileId);
+        const base = existing?.provider === draftProvider ? existing.settings : {};
+        const settings = { ...base } as Record<string, string>;
+        for (const field of FIELDS) {
+            if (field.provider !== draftProvider) continue;
+            const value = draftValues[field.key]?.trim();
+            if (value) settings[field.key] = value;
+        }
+        const providerConfig = PROVIDERS.find((provider) => provider.value === draftProvider)!;
+        const missing = providerConfig.required.filter((key) => !settings[key]);
+        if (missing.length) {
+            setMessage({ type: "error", text: `Complete the required ${missing.map((key) => FIELDS.find((field) => field.key === key)?.label ?? key).join(" and ")} field${missing.length > 1 ? "s" : ""}.` });
+            return;
+        }
+
+        const id = existing?.id ?? `profile-${globalThis.crypto?.randomUUID?.() ?? Date.now().toString(36)}`;
+        const profileName = draftName.trim() || `${providerConfig.label} ${profiles.filter((profile) => profile.provider === draftProvider).length + (existing ? 0 : 1)}`;
+        const nextProfiles = existing
+            ? profiles.map((profile) => profile.id === id ? { id, name: profileName, provider: draftProvider, settings } : profile)
+            : [...profiles, { id, name: profileName, provider: draftProvider, settings }];
+        const nextActiveId = activeProfileId ?? id;
+        try {
+            saveProviderProfiles({ profiles: nextProfiles, activeProfileId: nextActiveId });
+            const { value, error } = readProviderProfiles();
+            if (error || !value.profiles.some((profile) => profile.id === id)) throw new Error(error ?? "The profile was not retained in browser storage.");
+            setProfiles(value.profiles);
+            setActiveProfileId(value.activeProfileId);
+            setEditingProfileId(null);
+            setDraftValues({});
+            setMessage({ type: "success", text: `${profileName} saved in this browser.` });
+        } catch (e) {
+            setMessage({ type: "error", text: e instanceof Error ? e.message : "Could not save provider profile in browser storage." });
+        }
+    };
+
+    const handleActivateProfile = (profileId: string) => {
+        try {
+            const next = activateProviderProfile(profileId);
+            setActiveProfileId(next.activeProfileId);
+            setProfiles(next.profiles);
+            setMessage({ type: "success", text: "Active provider changed. AI requests will use this profile." });
+        } catch (e) {
+            setMessage({ type: "error", text: e instanceof Error ? e.message : "Could not activate this provider profile." });
+        }
+    };
+
+    const handleDeleteProfile = (profileId: string) => {
+        const remaining = profiles.filter((profile) => profile.id !== profileId);
+        const nextActiveId = activeProfileId === profileId ? remaining[0]?.id ?? null : activeProfileId;
+        try {
+            saveProviderProfiles({ profiles: remaining, activeProfileId: nextActiveId });
+            setProfiles(remaining);
+            setActiveProfileId(nextActiveId);
+            if (editingProfileId === profileId) setEditingProfileId(null);
+            setMessage({ type: "success", text: "Provider profile removed from this browser." });
+        } catch (e) {
+            setMessage({ type: "error", text: e instanceof Error ? e.message : "Could not remove provider profile." });
+        }
     };
 
     const handleClear = () => {
         setMessage(null);
-        clearLlmSettings();
-        setSavedValues({});
-        setForm({});
-        setMessage({ type: "success", text: "Settings cleared." });
+        try {
+            clearLlmSettings();
+            setProfiles([]);
+            setActiveProfileId(null);
+            setEditingProfileId(null);
+            setDraftValues({});
+            setMessage({ type: "success", text: "Provider profiles cleared from this browser profile for this site." });
+        } catch (e) {
+            setMessage({ type: "error", text: e instanceof Error ? e.message : "Could not clear browser storage." });
+        }
     };
 
     function maskKey(key: string | undefined): string {
@@ -458,7 +547,8 @@ export default function SettingsPage() {
         return key.slice(0, 4) + "…" + key.slice(-4);
     }
 
-    const selectedProvider = form.llm_provider || savedValues.llm_provider || "";
+    const activeProfile = profiles.find((profile) => profile.id === activeProfileId) ?? null;
+    const editingProfile = profiles.find((profile) => profile.id === editingProfileId) ?? null;
 
     return (
         <main className="flex flex-col gap-6">
@@ -517,47 +607,102 @@ export default function SettingsPage() {
                     ) : (
                         <>
                             <section className="rounded-xl border border-slate-200 bg-white/60 p-6 dark:border-slate-800 dark:bg-slate-950/40">
-                                <h2 className="mb-4 text-sm font-semibold text-slate-900 dark:text-slate-100">LLM Configuration</h2>
-
-                                <div className="flex flex-col gap-4">
-                                    {FIELDS.map((f) => {
-                                        if (f.provider && selectedProvider && f.provider !== selectedProvider) return null;
-
-                                        const currentVal = savedValues[f.key] ?? "";
-                                        const displayVal = f.sensitive && currentVal ? `Current: ${maskKey(currentVal)}` : (currentVal || f.placeholder);
-                                        const formVal = form[f.key] ?? "";
-
-                                        const inputCls = "rounded-md border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-emerald-500/40 placeholder:text-slate-400 focus:ring-2 dark:border-slate-700 dark:bg-slate-950 dark:placeholder:text-slate-600";
-
-                                        return (
-                                            <label key={f.key} className="flex flex-col gap-1">
-                                                <span className="text-xs font-medium text-slate-600 dark:text-slate-400">{f.label}</span>
-                                                {f.multiline ? (
-                                                    <textarea
-                                                        className={`${inputCls} resize-y font-mono text-xs`}
-                                                        rows={4}
-                                                        placeholder={displayVal}
-                                                        value={formVal}
-                                                        onChange={(e) => setForm((prev) => ({ ...prev, [f.key]: e.target.value }))}
-                                                    />
-                                                ) : (
-                                                    <input
-                                                        type={f.sensitive ? "password" : "text"}
-                                                        className={inputCls}
-                                                        placeholder={displayVal}
-                                                        value={formVal}
-                                                        onChange={(e) => setForm((prev) => ({ ...prev, [f.key]: e.target.value }))}
-                                                    />
-                                                )}
-                                            </label>
-                                        );
-                                    })}
+                                <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+                                    <div>
+                                        <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">Model provider profiles</h2>
+                                        <p className="mt-1 text-xs text-slate-500">Save multiple configurations, including multiple profiles for the same provider. Switching profiles takes effect immediately.</p>
+                                        <p className="mt-1 text-xs font-medium text-emerald-700 dark:text-emerald-300">Active for AI requests: {activeProfile?.name ?? "None selected"}</p>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        className="rounded-md bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-500"
+                                        onClick={handleAddProfile}
+                                    >
+                                        Add provider profile
+                                    </button>
                                 </div>
 
-                                {selectedProvider === "vertex" ? (
-                                    <p className="mt-3 text-xs text-slate-500">
-                                        Newer Claude models (Sonnet 5, Opus 4.8, …) are served on region <span className="font-mono">global</span>, not on a regional location such as <span className="font-mono">us-east5</span>. Example model id: <span className="font-mono">claude-sonnet-5</span>.
-                                    </p>
+                                {profiles.length ? (
+                                    <div className="mb-5 grid gap-3 md:grid-cols-2">
+                                        {profiles.map((profile) => {
+                                            const providerLabel = PROVIDERS.find((provider) => provider.value === profile.provider)?.label ?? profile.provider;
+                                            const settings = profile.settings as Record<string, string | undefined>;
+                                            const model = settings[`${profile.provider}_model`];
+                                            const endpoint = profile.provider === "vllm" ? settings.vllm_host : profile.provider === "ollama" ? settings.ollama_host : "";
+                                            const credentialKey = profile.provider === "anthropic" ? settings.anthropic_api_key
+                                                : profile.provider === "groq" ? settings.groq_api_key
+                                                    : profile.provider === "openai" ? settings.openai_api_key
+                                                        : profile.provider === "vertex" ? settings.vertex_sa_key
+                                                            : profile.provider === "vllm" ? settings.vllm_api_key : "";
+                                            const active = profile.id === activeProfileId;
+                                            return (
+                                                <article key={profile.id} className={`rounded-lg border p-4 ${active ? "border-emerald-500 bg-emerald-50/50 dark:border-emerald-700 dark:bg-emerald-950/20" : "border-slate-200 dark:border-slate-800"}`}>
+                                                    <div className="flex items-start justify-between gap-3">
+                                                        <div className="min-w-0">
+                                                            <div className="flex flex-wrap items-center gap-2">
+                                                                <h3 className="font-medium text-slate-900 dark:text-slate-100">{profile.name}</h3>
+                                                                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300">{providerLabel}</span>
+                                                                {active ? <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-medium text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-200">Active</span> : null}
+                                                            </div>
+                                                            <div className="mt-2 space-y-1 break-all text-xs text-slate-600 dark:text-slate-400">
+                                                                {model ? <p>Model: <span className="font-mono">{model}</span></p> : null}
+                                                                {endpoint ? <p>Endpoint: <span className="font-mono">{endpoint}</span></p> : null}
+                                                                {profile.provider === "vertex" && settings.vertex_project_id ? <p>Project: <span className="font-mono">{settings.vertex_project_id}</span>{settings.vertex_region ? ` · ${settings.vertex_region}` : ""}</p> : null}
+                                                                {profile.provider === "ollama" ? <p>Credential: not required</p> : credentialKey ? <p>Credential: <span className="font-mono">{maskKey(credentialKey)}</span></p> : profile.provider === "vllm" ? <p>API key: not set</p> : null}
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                    <div className="mt-4 flex flex-wrap gap-2">
+                                                        {!active ? <button type="button" className="rounded-md border border-emerald-500 px-3 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-50 dark:text-emerald-200 dark:hover:bg-emerald-950/40" onClick={() => handleActivateProfile(profile.id)}>Use this provider</button> : null}
+                                                        <button type="button" className="rounded-md border border-slate-300 px-3 py-1.5 text-xs hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-900" onClick={() => handleEditProfile(profile)}>Edit</button>
+                                                        <button type="button" className="rounded-md border border-rose-300 px-3 py-1.5 text-xs text-rose-700 hover:bg-rose-50 dark:border-rose-800 dark:text-rose-300 dark:hover:bg-rose-950/30" onClick={() => handleDeleteProfile(profile.id)}>Remove</button>
+                                                    </div>
+                                                </article>
+                                            );
+                                        })}
+                                    </div>
+                                ) : (
+                                    <p className="mb-5 rounded-lg border border-dashed border-slate-300 p-4 text-sm text-slate-500 dark:border-slate-700">No provider profiles saved yet. Add one to configure a model endpoint and credentials.</p>
+                                )}
+
+                                {editingProfileId !== null ? (
+                                    <div className="mb-5 rounded-lg border border-slate-300 p-4 dark:border-slate-700">
+                                        <h3 className="mb-3 text-sm font-semibold text-slate-900 dark:text-slate-100">{editingProfileId === "new" ? "New provider profile" : "Edit provider profile"}</h3>
+                                        <div className="grid gap-4 sm:grid-cols-2">
+                                            <label className="flex flex-col gap-1">
+                                                <span className="text-xs font-medium text-slate-600 dark:text-slate-400">Profile name</span>
+                                                <input className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950" placeholder="e.g. Work vLLM, Local Ollama" value={draftName} onChange={(e) => setDraftName(e.target.value)} />
+                                            </label>
+                                            <label className="flex flex-col gap-1">
+                                                <span className="text-xs font-medium text-slate-600 dark:text-slate-400">Provider</span>
+                                                <select className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950" value={draftProvider} onChange={(e) => { setDraftProvider(e.target.value as LlmProvider | ""); setDraftValues({}); }}>
+                                                    <option value="">Choose a provider</option>
+                                                    {PROVIDERS.map((provider) => <option key={provider.value} value={provider.value}>{provider.label}</option>)}
+                                                </select>
+                                            </label>
+                                        </div>
+                                        {draftProvider ? (
+                                            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                                                {FIELDS.filter((field) => field.provider === draftProvider).map((field) => {
+                                                    const original = editingProfile?.provider === draftProvider ? String(editingProfile.settings[field.key as keyof ProviderProfile["settings"]] ?? "") : "";
+                                                    const placeholder = field.sensitive && original ? `Saved (${maskKey(original)}); leave blank to keep` : original || field.placeholder;
+                                                    const inputClass = "rounded-md border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-emerald-500/40 placeholder:text-slate-400 focus:ring-2 dark:border-slate-700 dark:bg-slate-950 dark:placeholder:text-slate-600";
+                                                    return (
+                                                        <label key={field.key} className={`flex flex-col gap-1 ${field.multiline ? "sm:col-span-2" : ""}`}>
+                                                            <span className="text-xs font-medium text-slate-600 dark:text-slate-400">{field.label}</span>
+                                                            {field.multiline ? <textarea className={`${inputClass} resize-y font-mono text-xs`} rows={4} placeholder={placeholder} value={draftValues[field.key] ?? ""} onChange={(e) => setDraftValues((prev) => ({ ...prev, [field.key]: e.target.value }))} /> : <input type={field.sensitive ? "password" : "text"} className={inputClass} placeholder={placeholder} value={draftValues[field.key] ?? ""} onChange={(e) => setDraftValues((prev) => ({ ...prev, [field.key]: e.target.value }))} />}
+                                                        </label>
+                                                    );
+                                                })}
+                                            </div>
+                                        ) : null}
+                                        {draftProvider === "vertex" ? <p className="mt-3 text-xs text-slate-500">Newer Claude models (Sonnet 5, Opus 4.8, …) use the <span className="font-mono">global</span> region.</p> : null}
+                                        {draftProvider === "vllm" ? <p className="mt-3 text-xs text-slate-500">OpenAI-compatible endpoints use Chat Completions automatically. For an Anthropic-compatible server, enter its full Messages URL ending in <span className="font-mono">/v1/messages</span>; giTrack will send <span className="font-mono">x-api-key</span> and <span className="font-mono">anthropic-version</span>.</p> : null}
+                                        <div className="mt-4 flex gap-2">
+                                            <button type="button" className="rounded-md bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-500" onClick={handleSaveProfile}>Save profile</button>
+                                            <button type="button" className="rounded-md border border-slate-300 px-3 py-2 text-sm dark:border-slate-700" onClick={() => setEditingProfileId(null)}>Cancel</button>
+                                        </div>
+                                    </div>
                                 ) : null}
 
                                 {message ? (
@@ -571,18 +716,10 @@ export default function SettingsPage() {
                                 ) : null}
 
                                 <p className="mt-2 text-[11px] text-slate-400 dark:text-slate-500">
-                                    Settings are stored in this browser&apos;s localStorage. They are never sent to or saved on the server.
+                                    Provider profiles and credentials are saved in this browser for this site. Secrets are masked in the profile list. The active profile is sent with AI requests and is not persisted on the server.
                                 </p>
 
                                 <div className="mt-4 flex items-center gap-3">
-                                    <button
-                                        type="button"
-                                        className="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40"
-                                        disabled={Object.values(form).every((v) => !v.trim())}
-                                        onClick={handleSave}
-                                    >
-                                        Save Settings
-                                    </button>
                                     <button
                                         type="button"
                                         className="rounded-md border border-rose-300 px-4 py-2 text-sm font-medium text-rose-600 hover:bg-rose-50 dark:border-rose-700 dark:text-rose-400 dark:hover:bg-rose-950/30"
@@ -595,6 +732,29 @@ export default function SettingsPage() {
 
                             <section className="rounded-xl border border-slate-200 bg-white/60 p-6 dark:border-slate-800 dark:bg-slate-950/40">
                                 <h2 className="mb-4 text-sm font-semibold text-slate-900 dark:text-slate-100">Review</h2>
+                                <label className="mb-5 flex cursor-pointer items-start gap-3">
+                                    <input
+                                        type="checkbox"
+                                        className="mt-1"
+                                        checked={githubMcpReviewContext}
+                                        onChange={(e) => {
+                                            const next = e.target.checked;
+                                            try {
+                                                saveGithubMcpReviewContext(next);
+                                                setGithubMcpReviewContext(next);
+                                                setMessage({ type: "success", text: next ? "GitHub MCP context enabled for new AI reviews." : "GitHub MCP context disabled." });
+                                            } catch {
+                                                setMessage({ type: "error", text: "Could not save the GitHub MCP setting in browser storage." });
+                                            }
+                                        }}
+                                    />
+                                    <span>
+                                        <span className="text-sm font-medium text-slate-800 dark:text-slate-200">Add read-only GitHub MCP context to AI reviews</span>
+                                        <span className="mt-1 block text-xs text-slate-600 dark:text-slate-400">
+                                            Adds PR history and up to 5 changed-file contents to the existing diff review. When enabled, the signed-in GitHub token is used with GitHub&apos;s hosted MCP service, and the returned context is sent to your selected model provider. This does not enable GitHub write actions.
+                                        </span>
+                                    </span>
+                                </label>
                                 <label className="flex cursor-pointer items-start gap-3">
                                     <input
                                         type="checkbox"

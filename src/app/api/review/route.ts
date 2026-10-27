@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getPullDetail, getPullDiff } from "@/lib/github";
+import { getPullDetail, getPullDiff, getPullReviewThreadCounts, listCheckRunsForRef, listCommitStatuses, listPullReviews } from "@/lib/github";
 import { reviewPull } from "@/lib/review";
+import { summarizeChecks } from "@/lib/readiness";
 import { withSessionOverrides, UnauthenticatedError } from "@/lib/session";
 import { LlmNotConfiguredError } from "@/lib/llm";
+import { getGithubToken } from "@/lib/request-context";
+import { getGithubMcpReviewContext } from "@/lib/github-mcp";
 
 export const runtime = "nodejs";
 
@@ -17,6 +20,8 @@ export async function POST(req: NextRequest) {
             maxDiffChars?: number;
             customPrompt?: string;
             repoRulesContext?: string;
+            naturalReview?: boolean;
+            githubMcpContext?: boolean;
         };
 
         const owner = body.owner?.trim();
@@ -37,7 +42,26 @@ export async function POST(req: NextRequest) {
 
         const result = await withSessionOverrides(req, async (llmConfig) => {
             const detail = await getPullDetail(owner, repo, number);
-            const diff = await getPullDiff(owner, repo, number);
+            const [diff, reviews, reviewThreads, checkRuns, commitStatuses, githubMcp] = await Promise.all([
+                getPullDiff(owner, repo, number),
+                listPullReviews(owner, repo, number).catch(() => null),
+                getPullReviewThreadCounts(owner, repo, number).catch(() => null),
+                listCheckRunsForRef(owner, repo, detail.head.sha).catch(() => null),
+                listCommitStatuses(owner, repo, detail.head.sha).catch(() => null),
+                body.githubMcpContext === true
+                    ? getGithubMcpReviewContext(getGithubToken(), owner, repo, number, detail.head.sha)
+                    : Promise.resolve(null),
+            ]);
+            const latestByReviewer = new Map<string, (NonNullable<typeof reviews>[number])>();
+            for (const review of [...(reviews ?? [])].sort((a, b) => Date.parse(a.submitted_at ?? "") - Date.parse(b.submitted_at ?? ""))) {
+                const login = review.user?.login;
+                if (!login) continue;
+                if (review.state === "DISMISSED") latestByReviewer.delete(login);
+                else latestByReviewer.set(login, review);
+            }
+            const checks = checkRuns && commitStatuses
+                ? summarizeChecks([...checkRuns, ...commitStatuses])
+                : null;
             const review = await reviewPull({
                 owner,
                 repo,
@@ -47,11 +71,30 @@ export async function POST(req: NextRequest) {
                 maxDiffChars,
                 customPrompt: body.customPrompt?.trim(),
                 repoRulesContext: body.repoRulesContext?.trim(),
+                githubMcpContext: githubMcp?.context ?? undefined,
+                naturalReview: body.naturalReview === true,
+                reviewProgress: {
+                    state: detail.state,
+                    draft: detail.draft,
+                    mergeable: detail.mergeable,
+                    mergeableState: detail.mergeable_state,
+                    requestedReviewers: (detail.requested_reviewers ?? []).map(({ login }) => login),
+                    requestedTeams: (detail.requested_teams ?? []).map(({ slug }) => slug),
+                    checks: checks ? { total: checks.total, passing: checks.passing, failing: checks.failing, pending: checks.pending } : null,
+                    latestReviews: reviews ? [...latestByReviewer.values()].map((item) => ({
+                        reviewer: item.user?.login ?? "",
+                        state: item.state,
+                        submittedAt: item.submitted_at,
+                        commitId: item.commit_id,
+                    })) : null,
+                    unresolvedReviewThreads: reviewThreads?.unresolved ?? null,
+                },
                 llmConfig: llmConfig!,
             });
-            return { detail, review };
+            return { detail, review, githubMcp };
         });
 
+        const warning = [result.review.warning, result.githubMcp?.warning].filter(Boolean).join(" ") || undefined;
         return NextResponse.json({
             number,
             title: result.detail.title,
@@ -59,7 +102,12 @@ export async function POST(req: NextRequest) {
             summary: result.review.summary,
             verdict: result.review.verdict,
             comments: result.review.comments,
+            mergeReadinessScore: result.review.mergeReadinessScore,
+            mergeReadinessReason: result.review.mergeReadinessReason,
+            reviewedHeadSha: result.detail.head.sha,
             markdown: result.review.markdown,
+            warning,
+            githubMcpContextLoaded: Boolean(result.githubMcp?.context),
         });
     } catch (e) {
         if (e instanceof UnauthenticatedError) {

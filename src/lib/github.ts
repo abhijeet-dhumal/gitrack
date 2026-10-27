@@ -30,9 +30,12 @@ export async function githubFetch(path: string, options: GithubFetchOptions = {}
 export type PullListItem = {
   number: number;
   title: string;
+  body?: string | null;
   state: string;
   draft: boolean;
   user: { login: string } | null;
+  requested_reviewers?: Array<{ login: string }>;
+  requested_teams?: Array<{ slug: string }>;
   /** `head.repo` is the fork (or same repo) that contains `head.sha`; needed for Checks API on fork PRs. */
   head: {
     sha: string;
@@ -46,19 +49,262 @@ export type PullListItem = {
 export async function listPullRequests(
   owner: string,
   repo: string,
+  params: { state: "open" | "closed" | "all"; page: number; perPage: number; sort?: "updated" | "created" | "popularity" | "long-running"; direction?: "asc" | "desc" },
+) {
+  const q = new URLSearchParams({
+    state: params.state,
+    page: String(params.page),
+    per_page: String(params.perPage),
+    sort: params.sort ?? "updated",
+    direction: params.direction ?? "desc",
+  });
+  const res = await githubFetch(`/repos/${owner}/${repo}/pulls?${q}`);
+  const data = (await res.json()) as PullListItem[];
+  const link = res.headers.get("link") ?? "";
+  return { pulls: data, link };
+}
+
+export type IssueListItem = {
+  number: number;
+  title: string;
+  state: string;
+  html_url: string;
+  created_at: string;
+  updated_at: string;
+  comments: number;
+  user: { login: string } | null;
+  labels: Array<{ name: string; color: string }>;
+  assignees: Array<{ login: string }>;
+  milestone: { title: string; html_url: string } | null;
+  pull_request?: { url: string };
+};
+
+export async function listIssues(
+  owner: string,
+  repo: string,
+  params: { state: "open" | "closed" | "all"; page: number; perPage: number; filter: "all" | "needs-triage" | "unassigned" | "no-milestone" | "no-label" | "has-comments"; milestone?: number; search?: string; author?: string; assignee?: string; label?: string; milestoneTitle?: string; sort?: "updated" | "created" | "comments"; direction?: "asc" | "desc" },
+) {
+  if (params.milestone) {
+    const q = new URLSearchParams({ state: params.state, page: String(params.page), per_page: String(params.perPage), sort: params.sort ?? "updated", direction: params.direction ?? "desc" });
+    if (params.filter === "needs-triage") q.set("labels", "needs-triage");
+    if (params.filter === "unassigned") q.set("assignee", "none");
+    if (params.author) q.set("creator", params.author);
+    if (params.assignee) q.set("assignee", params.assignee);
+    if (params.label) q.set("labels", params.label);
+    const res = await githubFetch(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?milestone=${params.milestone}&${q}`);
+    const rows = await res.json() as IssueListItem[];
+    const issues = rows.filter((issue) => !issue.pull_request);
+    return { issues, totalCount: 0, link: res.headers.get("link") ?? "" };
+  }
+  const terms = [`repo:${owner}/${repo}`, "is:issue"];
+  if (params.state !== "all") terms.push(`is:${params.state}`);
+  if (params.filter === "needs-triage") terms.push("label:needs-triage");
+  if (params.filter === "unassigned") terms.push("no:assignee");
+  if (params.filter === "no-milestone") terms.push("no:milestone");
+  if (params.filter === "no-label") terms.push("no:label");
+  if (params.filter === "has-comments") terms.push("comments:>0");
+  if (params.author) terms.push(`author:${params.author}`);
+  if (params.assignee) terms.push(`assignee:${params.assignee}`);
+  if (params.label) terms.push(`label:"${params.label.replace(/[\\"]+/g, "\\$&")}"`);
+  if (params.milestoneTitle) terms.push(`milestone:"${params.milestoneTitle.replace(/[\\"]+/g, "\\$&")}"`);
+  if (params.search?.trim()) terms.push(`${params.search.trim()} in:title,body`);
+  const q = new URLSearchParams({
+    q: terms.join(" "),
+    page: String(params.page),
+    per_page: String(params.perPage),
+    sort: params.sort ?? "updated",
+    order: params.direction ?? "desc",
+  });
+  // shortcut: GitHub search caps results at 1,000; use iterative issues API pagination for larger repositories.
+  const res = await githubFetch(`/search/issues?${q}`);
+  const data = (await res.json()) as { items: IssueListItem[]; total_count: number };
+  const link = res.headers.get("link") ?? "";
+  return { issues: data.items ?? [], totalCount: data.total_count ?? 0, link };
+}
+
+export type ClosingPullRequest = { number: number; title: string; url: string; state: "OPEN" | "CLOSED"; merged: boolean };
+type MilestoneIssuePage = {
+  repository: { milestone: { issues: { pageInfo: { hasNextPage: boolean; endCursor: string | null }; nodes: Array<{ state: "OPEN" | "CLOSED"; closedByPullRequestsReferences: { nodes: Array<{ number: number; state: "OPEN" | "CLOSED"; mergedAt: string | null }> } }> } } | null };
+};
+
+async function githubGraphql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
+  const response = await githubFetch("/graphql", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  const data = (await response.json()) as { data?: T; errors?: Array<{ message: string }> };
+  if (data.errors?.length || !data.data) throw new Error(data.errors?.map((e) => e.message).join("; ") || "GitHub GraphQL returned no data");
+  return data.data;
+}
+
+export async function getPullReviewThreadCounts(owner: string, repo: string, number: number) {
+  type ThreadPage = { nodes: Array<{ isResolved: boolean }>; pageInfo: { hasNextPage: boolean; endCursor: string | null } };
+  type ThreadResponse = { repository: { pullRequest: { reviewThreads: ThreadPage } | null } };
+  let after: string | null = null;
+  let total = 0;
+  let unresolved = 0;
+  let hasNextPage = true;
+  while (hasNextPage) {
+    const data: ThreadResponse = await githubGraphql<ThreadResponse>(
+      `query($owner:String!,$repo:String!,$number:Int!,$after:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{isResolved}}}}}`,
+      { owner, repo, number, after },
+    );
+    const threads: ThreadPage | null = data.repository.pullRequest?.reviewThreads ?? null;
+    if (!threads) throw new Error(`Pull request #${number} was not found`);
+    total += threads.nodes.length;
+    unresolved += threads.nodes.filter((thread) => !thread.isResolved).length;
+    hasNextPage = threads.pageInfo.hasNextPage;
+    after = threads.pageInfo.endCursor;
+  }
+  return { total, unresolved };
+}
+
+export async function listIssueClosingPullRequests(owner: string, repo: string, number: number) {
+  // shortcut: each issue returns at most 100 closing references; paginate if a single issue can exceed that.
+  const data = await githubGraphql<{ repository: { issue: { closedByPullRequestsReferences: { nodes: Array<{ number: number; title: string; url: string; state: "OPEN" | "CLOSED"; mergedAt: string | null }> } } | null } }>(
+    `query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){issue(number:$number){closedByPullRequestsReferences(first:100,includeClosedPrs:true){nodes{number title url state mergedAt}}}}}`,
+    { owner, repo, number },
+  );
+  return (data.repository.issue?.closedByPullRequestsReferences.nodes ?? []).map((pr) => ({ ...pr, merged: Boolean(pr.mergedAt) })) as ClosingPullRequest[];
+}
+
+export type PullLinkedIssue = { number: number; title: string; url: string; state: "OPEN" | "CLOSED" };
+
+export async function listPullLinkedIssuesBatch(
+  owner: string,
+  repo: string,
+  numbers: number[],
+): Promise<Record<number, PullLinkedIssue[]>> {
+  const uniqueNumbers = [...new Set(numbers.filter((number) => Number.isInteger(number) && number > 0))];
+  if (uniqueNumbers.length === 0) return {};
+
+  const connection = "closingIssuesReferences(first:100){nodes{number title url state}}";
+  const aliases = uniqueNumbers.map((number, index) => `pr${index}:pullRequest(number:${number}){${connection}}`).join(" ");
+  const data = await githubGraphql<{ repository: Record<string, { closingIssuesReferences: { nodes: PullLinkedIssue[] } } | null> }>(
+    `query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){${aliases}}}`,
+    { owner, repo },
+  );
+
+  return Object.fromEntries(uniqueNumbers.map((number, index) => [
+    number,
+    data.repository[`pr${index}`]?.closingIssuesReferences.nodes ?? [],
+  ]));
+}
+
+export async function listPullLinkedIssues(owner: string, repo: string, number: number): Promise<PullLinkedIssue[]> {
+  const linkedIssues = await listPullLinkedIssuesBatch(owner, repo, [number]);
+  return linkedIssues[number] ?? [];
+}
+
+export async function getMilestoneClosingPullRequestCounts(owner: string, repo: string, number: number) {
+  let after: string | null = null;
+  let openIssues = 0;
+  let closedIssues = 0;
+  const openPullRequests = new Set<number>();
+  const mergedPullRequests = new Set<number>();
+  let hasNextPage = true;
+  while (hasNextPage) {
+    const data: MilestoneIssuePage = await githubGraphql<MilestoneIssuePage>(
+      `query($owner:String!,$repo:String!,$number:Int!,$after:String){repository(owner:$owner,name:$repo){milestone(number:$number){issues(first:100,after:$after,states:[OPEN,CLOSED]){pageInfo{hasNextPage endCursor}nodes{state closedByPullRequestsReferences(first:100,includeClosedPrs:true){nodes{number state mergedAt}}}}}}}`,
+      { owner, repo, number, after },
+    );
+    const issues = data.repository.milestone?.issues;
+    if (!issues) throw new Error(`Milestone #${number} was not found`);
+    for (const issue of issues.nodes) {
+      if (issue.state === "OPEN") openIssues++;
+      else closedIssues++;
+      for (const pr of issue.closedByPullRequestsReferences.nodes) {
+        if (pr.mergedAt) mergedPullRequests.add(pr.number);
+        else if (pr.state === "OPEN") openPullRequests.add(pr.number);
+      }
+    }
+    hasNextPage = issues.pageInfo.hasNextPage;
+    after = issues.pageInfo.endCursor;
+  }
+  return { openIssues, closedIssues, openClosingPullRequests: openPullRequests.size, mergedClosingPullRequests: mergedPullRequests.size };
+}
+
+export type MaintainerQueueKey = "needsTriage" | "needsReview" | "needsChanges" | "waitingOnChecks";
+type SearchableMaintainerQueueKey = Exclude<MaintainerQueueKey, "needsReview">;
+const maintainerQueueQualifiers: Record<SearchableMaintainerQueueKey, { kind: "issue" | "pr"; qualifier: string }> = {
+  needsTriage: { kind: "issue", qualifier: "label:needs-triage" },
+  needsChanges: { kind: "pr", qualifier: "review:changes_requested" },
+  waitingOnChecks: { kind: "pr", qualifier: "status:pending" },
+};
+
+export function maintainerQueueSearchQuery(owner: string, repo: string, queue: SearchableMaintainerQueueKey) {
+  const { kind, qualifier } = maintainerQueueQualifiers[queue];
+  return `repo:${owner}/${repo} is:${kind} is:open ${qualifier}`;
+}
+
+export async function listPullRequestsAwaitingReview(owner: string, repo: string, search?: string) {
+  const matches: PullListItem[] = [];
+  const needle = search?.trim().replace(/^#/, "").toLocaleLowerCase();
+  let page = 1;
+  while (true) {
+    const { pulls } = await listPullRequests(owner, repo, { state: "open", page, perPage: 100 });
+    for (const pull of pulls) {
+      if (!(pull.requested_reviewers?.length || pull.requested_teams?.length)) continue;
+      if (needle && !`${pull.number} ${pull.title} ${pull.body ?? ""}`.toLocaleLowerCase().includes(needle)) continue;
+      matches.push(pull);
+    }
+    if (pulls.length < 100) break;
+    page++;
+  }
+  return matches;
+}
+
+export async function searchPullRequestQueue(owner: string, repo: string, queue: Exclude<MaintainerQueueKey, "needsTriage">, page: number, perPage: number, search?: string) {
+  if (queue === "needsReview") {
+    const matches = await listPullRequestsAwaitingReview(owner, repo, search);
+    const lastPage = Math.max(1, Math.ceil(matches.length / perPage));
+    return {
+      pullNumbers: matches.slice((page - 1) * perPage, page * perPage).map((pull) => pull.number),
+      totalCount: matches.length,
+      pagination: { page, perPage, nextPage: page < lastPage ? page + 1 : null, lastPage, hasMore: page < lastPage },
+    };
+  }
+  // shortcut: GitHub Search paginates up to 1,000 matching PRs; use REST iteration for larger queues.
+  const terms = [maintainerQueueSearchQuery(owner, repo, queue)];
+  if (search?.trim()) terms.push(`${search.trim()} in:title,body`);
+  const q = new URLSearchParams({ q: terms.join(" "), page: String(page), per_page: String(perPage), sort: "updated", order: "asc" });
+  const res = await githubFetch(`/search/issues?${q}`);
+  const data = (await res.json()) as { items: Array<{ number: number }>; total_count: number };
+  const pages = parseLinkHeader(res.headers.get("link") ?? "");
+  return {
+    pullNumbers: (data.items ?? []).map((item) => item.number),
+    totalCount: data.total_count ?? 0,
+    pagination: { page, perPage, nextPage: pages.next ?? null, lastPage: pages.last ?? null, hasMore: pages.next !== undefined },
+  };
+}
+
+export type MilestoneListItem = {
+  number: number;
+  title: string;
+  description: string | null;
+  state: "open" | "closed";
+  html_url: string;
+  due_on: string | null;
+  open_issues: number;
+  closed_issues: number;
+};
+
+export async function listMilestones(
+  owner: string,
+  repo: string,
   params: { state: "open" | "closed" | "all"; page: number; perPage: number },
 ) {
   const q = new URLSearchParams({
     state: params.state,
     page: String(params.page),
     per_page: String(params.perPage),
-    sort: "updated",
-    direction: "desc",
+    sort: "due_on",
+    direction: "asc",
   });
-  const res = await githubFetch(`/repos/${owner}/${repo}/pulls?${q}`);
-  const data = (await res.json()) as PullListItem[];
-  const link = res.headers.get("link") ?? "";
-  return { pulls: data, link };
+  const res = await githubFetch(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/milestones?${q}`);
+  const milestones = (await res.json()) as MilestoneListItem[];
+  return { milestones, link: res.headers.get("link") ?? "" };
 }
 
 export async function searchPullRequests(
@@ -102,8 +348,11 @@ export type PullDetail = {
   mergeable: boolean | null;
   mergeable_state?: string;
   user: { login: string } | null;
+  labels?: Array<{ name: string; color: string; description?: string | null }>;
   head: { sha: string; ref: string };
   base: { ref: string };
+  requested_reviewers?: Array<{ login: string }>;
+  requested_teams?: Array<{ slug: string }>;
   comments: number;
   review_comments: number;
   commits: number;
@@ -124,6 +373,7 @@ export type ReviewItem = {
   user: { login: string } | null;
   state: "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED" | "DISMISSED" | string;
   submitted_at: string | null;
+  commit_id?: string | null;
 };
 
 export async function listPullReviews(owner: string, repo: string, number: number) {
@@ -395,6 +645,7 @@ async function listDirEntries(owner: string, repo: string, path: string, ref?: s
 export type RepoRules = {
     cursor: { path: string; content: string }[];
     claude: { path: string; content: string }[];
+    agents: { path: string; content: string }[];
 };
 
 async function collectFiles(
@@ -479,8 +730,26 @@ async function collectSkillFiles(
     return out;
 }
 
+async function collectMarkdownTree(
+    owner: string, repo: string, ref: string | undefined, rootPath: string,
+): Promise<{ path: string; content: string }[]> {
+    const dirs = [rootPath];
+    const files: ContentsEntry[] = [];
+    while (dirs.length) {
+        const current = dirs.splice(0);
+        const results = await Promise.all(current.map((path) => listDirEntries(owner, repo, path, ref)));
+        for (const entries of results) {
+            for (const entry of entries) {
+                if (entry.type === "dir") dirs.push(entry.path);
+                else if (/\.(md|mdc)$/i.test(entry.name)) files.push(entry);
+            }
+        }
+    }
+    return collectFiles(owner, repo, ref, files, /\.(md|mdc)$/i);
+}
+
 export async function fetchRepoRules(owner: string, repo: string, ref?: string): Promise<RepoRules> {
-    const rules: RepoRules = { cursor: [], claude: [] };
+    const rules: RepoRules = { cursor: [], claude: [], agents: [] };
 
     const [
         cursorrules,
@@ -517,9 +786,9 @@ export async function fetchRepoRules(owner: string, repo: string, ref?: string):
         rules.claude.push({ path: "CLAUDE.md", content: rootClaude });
     }
 
-    // Claude: root AGENTS.md
+    // Agents: root AGENTS.md
     if (rootAgents) {
-        rules.claude.push({ path: "AGENTS.md", content: rootAgents });
+        rules.agents.push({ path: "AGENTS.md", content: rootAgents });
     }
 
     // Claude: .claude/*.md
@@ -531,6 +800,9 @@ export async function fetchRepoRules(owner: string, repo: string, ref?: string):
     // Claude: .claude/skills/*/SKILL.md (nested) + any loose .md files
     rules.claude.push(...await collectFiles(owner, repo, ref, claudeSkillsDir, mdPattern));
     rules.claude.push(...await collectSkillFiles(owner, repo, ref, claudeSkillsDir));
+
+    // Agent guidance and skills can be nested at any depth under .agents.
+    rules.agents.push(...await collectMarkdownTree(owner, repo, ref, ".agents"));
 
     return rules;
 }

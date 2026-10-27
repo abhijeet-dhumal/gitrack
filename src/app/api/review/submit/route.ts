@@ -28,6 +28,8 @@ const VERDICT_TO_EVENT: Record<string, "APPROVE" | "REQUEST_CHANGES" | "COMMENT"
     comment: "COMMENT",
 };
 
+class InvalidInlineReviewComment extends Error {}
+
 function parseLine(raw?: string): { line?: number; start_line?: number } {
     if (!raw) return {};
     const range = raw.match(/^(\d+)\s*[-–]\s*(\d+)$/);
@@ -50,7 +52,7 @@ function formatCommentBody(c: ReviewComment, includeHeading: boolean): string {
     const heading = headingLine(c, includeHeading);
     const lines: string[] = heading ? [heading, "", c.body] : [c.body];
     if (c.suggested_code) {
-        lines.push("", "**Suggested:**", "```suggestion", c.suggested_code, "```");
+        lines.push("", "```suggestion", c.suggested_code, "```");
     }
     return lines.join("\n");
 }
@@ -82,6 +84,7 @@ export async function POST(req: NextRequest) {
             verdict?: string;
             comments?: ReviewComment[];
             includeCommentHeading?: boolean;
+            requireInline?: boolean;
         };
 
         const owner = body.owner?.trim();
@@ -116,9 +119,12 @@ export async function POST(req: NextRequest) {
             for (const c of comments) {
                 const { line, start_line } = parseLine(c.line);
                 const fileLines = validLines.get(c.file);
+                if (body.requireInline && (!line || !fileLines?.has(line) || (start_line !== undefined && !fileLines.has(start_line)))) {
+                    throw new InvalidInlineReviewComment(`Cannot post an inline comment at ${c.file}:${c.line ?? "unknown line"}; choose a line in the current PR diff.`);
+                }
 
                 if (line && fileLines && fileLines.size > 0) {
-                    const snapped = snapToValidLine(line, fileLines);
+                    const snapped = body.requireInline ? line : snapToValidLine(line, fileLines);
                     if (snapped) {
                         const entry: { path: string; body: string; line: number; start_line?: number } = {
                             path: c.file,
@@ -152,6 +158,9 @@ export async function POST(req: NextRequest) {
             url: result.html_url,
         });
     } catch (e) {
+        if (e instanceof InvalidInlineReviewComment) {
+            return NextResponse.json({ error: e.message }, { status: 422 });
+        }
         if (e instanceof UnauthenticatedError) {
             return NextResponse.json({ error: e.message }, { status: 401 });
         }

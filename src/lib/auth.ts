@@ -1,5 +1,5 @@
 import { cookies } from "next/headers";
-import { encrypt, decrypt } from "@/lib/crypto";
+import { encrypt, decrypt, getEncryptionSecret } from "@/lib/crypto";
 
 const COOKIE_NAME = "gitrack.session";
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 days
@@ -15,10 +15,6 @@ export type SessionData = {
     user: GitHubUser;
     token: string;
 };
-
-function getSecret(): string {
-    return process.env.SETTINGS_ENCRYPTION_KEY ?? "gitrack-default-key-change-me";
-}
 
 export async function verifyGitHubToken(token: string): Promise<GitHubUser> {
     const res = await fetch("https://api.github.com/user", {
@@ -42,7 +38,7 @@ export async function verifyGitHubToken(token: string): Promise<GitHubUser> {
 
 export async function createSession(user: GitHubUser, token: string): Promise<void> {
     const payload: SessionData = { user, token };
-    const encrypted = encrypt(JSON.stringify(payload), getSecret());
+    const encrypted = encrypt(JSON.stringify(payload), getEncryptionSecret());
     const jar = await cookies();
     jar.set(COOKIE_NAME, encrypted, {
         httpOnly: true,
@@ -58,7 +54,7 @@ export async function getSession(): Promise<SessionData | null> {
     const cookie = jar.get(COOKIE_NAME);
     if (!cookie?.value) return null;
     try {
-        const json = decrypt(cookie.value, getSecret());
+        const json = decrypt(cookie.value, getEncryptionSecret());
         return JSON.parse(json) as SessionData;
     } catch {
         return null;

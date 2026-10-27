@@ -1,9 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getSession } from "@/lib/auth";
 import { listRules, saveRule, deleteRule } from "@/lib/rules-store";
 
 export const runtime = "nodejs";
 
 export async function GET(req: NextRequest) {
+    if (!await getSession()) {
+        return NextResponse.json({ error: "Authentication required" }, { status: 401 });
+    }
+
     const owner = req.nextUrl.searchParams.get("owner")?.trim();
     const repo = req.nextUrl.searchParams.get("repo")?.trim();
 
@@ -17,6 +22,10 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
     try {
+        if (!await getSession()) {
+            return NextResponse.json({ error: "Authentication required" }, { status: 401 });
+        }
+
         const body = (await req.json()) as {
             owner?: string;
             repo?: string;
@@ -46,6 +55,10 @@ export async function POST(req: NextRequest) {
 
 export async function DELETE(req: NextRequest) {
     try {
+        if (!await getSession()) {
+            return NextResponse.json({ error: "Authentication required" }, { status: 401 });
+        }
+
         const body = (await req.json()) as {
             owner?: string;
             repo?: string;

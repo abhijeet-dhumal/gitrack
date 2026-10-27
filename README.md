@@ -14,7 +14,8 @@ https://github.com/user-attachments/assets/3610525f-c552-47ab-a0c9-b785b70a89ae
 - **At a glance** — AI-generated panel highlighting the key code changes with file paths, line numbers, and diff snippets
 - **Review Guide** — AI-generated checklist, risk hotspots, and testing suggestions with color-coded sections
 - **Full AI Review** — on-demand detailed PR review via the configured LLM, with inline code comments
-- **Repo rules/skills** — reads `.cursorrules`, `.cursor/rules`, `.claude` rules/skills from the repository and includes them in AI reviews
+- **Optional GitHub MCP review context** — enriches reviews with PR history and a bounded sample of changed-file contents through GitHub's read-only hosted MCP server
+- **Repo rules/skills** — reads `.cursorrules`, `.cursor`, `.claude`, `AGENTS.md`, and Markdown guidance under `.agents` for AI reviews
 - **Editable AI review** — edit the AI-generated review summary before submitting to GitHub
 - **PR auto-assignment** — rule-based reviewer assignment by PR size (XS–XXL) and title keywords; configured per repo in Settings
 - **Cross-repo search** — search by PR number or title text across all pages (uses GitHub Search API)
@@ -33,7 +34,9 @@ https://github.com/user-attachments/assets/3610525f-c552-47ab-a0c9-b785b70a89ae
 | **Ollama** | Host URL (local) | `llama3` |
 | **vLLM** | Host URL + optional API key | Auto-detected from server |
 
-All LLM credentials are configured per-user in the browser **Settings** page and stored in `localStorage`. They are transmitted to the server via a request header (`X-LLM-Settings`) per-request and **never persisted server-side**. No server-side secrets are required.
+All LLM credentials are configured per-user in the browser **Settings** page and stored in `localStorage`. They are included in app requests that need provider configuration and **never persisted server-side**. The app also uses a stable server-side encryption secret for GitHub session cookies and saved assignment rules.
+
+GitHub MCP context is off by default and can be enabled in **Settings → Review**. When enabled, giTrack uses the signed-in GitHub token to fetch PR details, changed files, prior reviews, and comments from GitHub's hosted MCP endpoint. It adds up to five changed-file contents and a bounded amount of PR discussion to the normal diff-based review. GitHub MCP access is read-only; review submission continues through giTrack's existing GitHub API path. The collected context is also sent to the selected LLM provider. If MCP context cannot be fetched, the review continues with the usual PR diff and the modal shows a warning.
 
 OpenAI uses an OpenAI Platform API key with the Responses API. A ChatGPT or Codex subscription login is not used as an API key; configure an API key from the OpenAI Platform instead.
 
@@ -42,8 +45,8 @@ OpenAI uses an OpenAI Platform API key with the Responses API. A ChatGPT or Code
 giTrack is designed for **multi-user deployments** where credential isolation is critical:
 
 - **No `process.env` mutation** — credentials are passed explicitly via function parameters and `AsyncLocalStorage` (request-scoped). Concurrent requests cannot see each other's credentials.
-- **No server-side credential storage** — LLM keys and GitHub tokens are stored only in the user's browser (`localStorage`).
-- **Logout clears credentials** — signing out removes all stored LLM settings from the browser.
+- **Credential storage is scoped** — LLM keys stay in browser `localStorage`; the GitHub session token lives in an encrypted HTTP-only cookie.
+- **Logout preserves provider keys** — signing out clears the GitHub session cookie but keeps browser-local provider settings until **Clear All** is used.
 - **Missing credentials = clear error** — if no LLM provider is configured, the API returns a 422 with a message directing the user to Settings.
 
 ## Authentication
@@ -138,24 +141,28 @@ The SA key is stored in your browser only and sent to the server per-request. It
 
 ## Deploying on OpenShift
 
-giTrack requires **zero server-side secrets** — all credentials are provided by users via the browser Settings page. This makes deployment simple.
+GitHub and LLM credentials are provided by users, but the app needs one server-side encryption secret for its GitHub session cookie and saved assignment rules. Keep that secret unchanged across restarts.
 
 ### Prerequisites
 
 - OpenShift cluster with `oc` CLI authenticated
-- `oc` logged in with permissions to create Deployments, Routes, and Services
+- `oc` logged in with permissions to create Secrets, Deployments, Routes, and Services
 
 ### 1. Deploy
 
 ```bash
 oc new-project gitrack
 
+# Generate this value once and retain it for future deployments/restores.
+oc create secret generic gitrack-encryption \
+  --from-literal=settings-encryption-key="$(openssl rand -hex 32)"
+
 oc apply -f openshift/deployment.yaml
 oc apply -f openshift/service.yaml
 oc apply -f openshift/route.yaml
 ```
 
-That's it — no secrets, no PVCs, no environment variables to configure.
+The Secret is used to decrypt sessions after pod restarts. Do not recreate it during routine deploys; changing it signs users out and makes existing encrypted assignment rules unreadable.
 
 ### 2. Verify
 

@@ -5,6 +5,13 @@ const KEY_LEN = 32;
 const IV_LEN = 16;
 const TAG_LEN = 16;
 
+export function getEncryptionSecret(): string {
+    const configured = process.env.SETTINGS_ENCRYPTION_KEY?.trim();
+    if (configured) return configured;
+    if (process.env.NODE_ENV === "production") throw new Error("SETTINGS_ENCRYPTION_KEY must be configured in production");
+    return "gitrack-default-key-change-me";
+}
+
 function deriveKey(secret: string): Buffer {
     return scryptSync(secret, "gitrack-settings-salt", KEY_LEN);
 }

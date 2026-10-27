@@ -4,7 +4,9 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useAiMode } from "@/components/AiModeContext";
-import { useMetrics } from "@/components/MetricsContext";
+import { useAuth } from "@/components/AuthContext";
+import { IssuesInbox, MaintainerOverview, MilestoneTracker, ListOptions, type IssueFilter, type IssueSort } from "@/components/MaintainerViews";
+import { ReviewChat } from "@/components/ReviewChat";
 import {
     buildLlmHeaders,
     parseRepoInput,
@@ -15,30 +17,33 @@ import {
     saveReviewRule,
     deleteReviewRule,
     loadReviewCommentHeading,
+    loadGithubMcpReviewContext,
+    readProviderProfiles,
+    activateProviderProfile,
+    type ProviderProfile,
     type RepoBookmark,
     type SavedRule,
 } from "@/lib/client-settings";
-
-function getSessionHeaders(): Record<string, string> {
-    return buildLlmHeaders();
-}
 
 type ReviewItem = {
   id: number;
   user: { login: string } | null;
   state: string;
   submitted_at: string | null;
+  commit_id?: string | null;
 };
 
 type PullRow = {
   number: number;
   title: string;
   author: string;
+  labels?: Array<{ name: string; color: string; description?: string | null }>;
   state: string;
   draft: boolean;
   mergeable: boolean | null;
   mergeable_state?: string;
   head: string;
+  head_sha?: string;
   base: string;
   created_at: string;
   updated_at: string;
@@ -50,13 +55,7 @@ type PullRow = {
   deletions: number;
   changed_files: number;
   readiness: {
-    score: number;
     breakdown: {
-      draftPenalty: number;
-      mergePenalty: number;
-      reviewPenalty: number;
-      checkPenalty: number;
-      approvalBonus: number;
       pendingChecks: number;
       failingChecks: number;
       approvals: number;
@@ -65,10 +64,15 @@ type PullRow = {
   };
   checks: { total: number; failing: number; pending: number };
   reviews: ReviewItem[];
+  reviewThreads?: { total: number; unresolved: number } | null;
+  requested_reviewers?: Array<{ login: string }>;
+  requested_teams?: Array<{ slug: string }>;
+  linkedIssues?: Array<{ number: number; title: string; url: string; state: "OPEN" | "CLOSED" }>;
 };
 
 type PrsResponse = {
   pulls: PullRow[];
+  totalCount?: number;
   pagination: {
     page: number;
     perPage: number;
@@ -84,9 +88,54 @@ type PriorityView =
   | "needsChanges"
   | "blocked"
   | "waitingOnChecks"
-  | "draft";
+  | "draft"
+  | "needsReview"
+  | "reviewRequested"
+  | "waitingOnAuthor"
+  | "approved"
+  | "checksFailing"
+  | "conflict";
 
-type PrioritySort = "updatedDesc" | "reviewReadyThenScore" | "highestReadiness" | "oldestUpdated";
+type PrioritySort = "updatedDesc" | "updatedAsc" | "createdDesc" | "createdAsc" | "popularity" | "longRunning" | "readyFirst" | "largestDiff" | "smallestDiff" | "mostComments" | "mostCommits" | "recentActivity" | "oldestActivity" | "highestReadiness" | "lowestReadiness";
+type RepositoryView = "pulls" | "issues" | "milestones" | "rules" | "metrics";
+type RepositoryState = "open" | "closed" | "all";
+type DashboardSessionState = {
+  view: RepositoryView;
+  repoInput: string;
+  owner: string;
+  repo: string;
+  prState: RepositoryState;
+  prPerPage: number;
+  issuesState: RepositoryState;
+  issuesPerPage: number;
+  milestonesState: RepositoryState;
+  milestonesPerPage: number;
+  metricsDays: number;
+  naturalReview?: boolean;
+  state?: RepositoryState;
+  perPage?: number;
+  page: number;
+  priorityView: PriorityView;
+  maintainerQueue: "needsReview" | "needsChanges" | "waitingOnChecks" | null;
+  issueFilter: IssueFilter;
+  issueSearch: string;
+  prioritySort: PrioritySort;
+  prAuthorFilter?: string;
+  prSizeFilter?: string;
+  issueAuthor?: string;
+  issueAssignee?: string;
+  issueLabel?: string;
+  issueMilestone?: string;
+  issueSort?: IssueSort;
+  search: string;
+  reviewerFilter: string;
+  dataForRepo: string | null;
+  data: PrsResponse | null;
+};
+
+const DASHBOARD_SESSION_KEY = "gitrack:dashboard-session";
+const REVIEW_CACHE_SESSION_KEY = "gitrack:ai-review-cache";
+const METRICS_CACHE_SESSION_KEY = "gitrack:metrics-cache";
 
 function isConflicted(p: PullRow) {
   return p.mergeable === false || p.mergeable_state === "dirty";
@@ -99,7 +148,7 @@ function isReviewReady(p: PullRow) {
   if (p.checks.failing > 0) return false;
   if (p.checks.pending > 0) return false;
   if (p.readiness.breakdown.changesRequested > 0) return false;
-  return p.readiness.score >= 80;
+  return true;
 }
 
 function reviewReadyReason(p: PullRow) {
@@ -109,14 +158,7 @@ function reviewReadyReason(p: PullRow) {
   if (p.checks.failing > 0) return `Failing checks: ${p.checks.failing}`;
   if (p.checks.pending > 0) return `Pending checks: ${p.checks.pending}`;
   if (p.readiness.breakdown.changesRequested > 0) return `Changes requested: ${p.readiness.breakdown.changesRequested}`;
-  if (p.readiness.score < 80) return `Low readiness score (${p.readiness.score})`;
   return "Ready for review";
-}
-
-function scoreTone(score: number) {
-  if (score >= 80) return "text-emerald-700 dark:text-emerald-300";
-  if (score >= 55) return "text-amber-700 dark:text-amber-300";
-  return "text-rose-700 dark:text-rose-300";
 }
 
 function prStatusBadge(p: PullRow): { label: string; cls: string } {
@@ -157,13 +199,74 @@ type ReviewCommentData = {
   suggested_code?: string;
 };
 
+function reviewCommentKey(comment: ReviewCommentData, index: number) {
+  return JSON.stringify([index, comment.file, comment.line ?? "", comment.title, comment.body, comment.suggested_code ?? ""]);
+}
+
 type ReviewData = {
   summary?: string;
+  generalComment?: string;
   verdict?: string;
   comments?: ReviewCommentData[];
   markdown?: string;
   model?: string;
+  mergeReadinessScore?: number;
+  mergeReadinessReason?: string;
+  reviewedHeadSha?: string;
+  warning?: string;
+  githubMcpContextLoaded?: boolean;
+  submittedCommentUrls?: Record<string, string | true>;
 };
+
+type LinkedIssue = { number: number; title: string; url: string; state: "OPEN" | "CLOSED" };
+
+function reviewCacheKey(owner: string, repo: string, number: number, naturalReview: boolean, profileId = "", githubMcpContext = false) {
+  return `${owner.trim().toLowerCase()}/${repo.trim().toLowerCase()}#${number}:${naturalReview}${profileId ? `:profile:${profileId}` : ""}${githubMcpContext ? ":github-mcp" : ""}`;
+}
+
+function persistReviewCacheEntry(key: string, review: ReviewData) {
+  try {
+    const cached = JSON.parse(sessionStorage.getItem(REVIEW_CACHE_SESSION_KEY) ?? "{}") as Record<string, ReviewData>;
+    delete cached[key];
+    cached[key] = review;
+    sessionStorage.setItem(REVIEW_CACHE_SESSION_KEY, JSON.stringify(Object.fromEntries(Object.entries(cached).slice(-15))));
+  } catch { /* Cached AI reviews are optional when browser storage is unavailable. */ }
+}
+
+function readPersistedReviewCacheEntry(key: string): ReviewData | undefined {
+  try {
+    return (JSON.parse(sessionStorage.getItem(REVIEW_CACHE_SESSION_KEY) ?? "{}") as Record<string, ReviewData>)[key];
+  } catch { /* Cached AI reviews are optional when browser storage is unavailable. */ }
+}
+
+function legacyReviewForProfile(review: ReviewData | undefined, profile: ProviderProfile | undefined): ReviewData | undefined {
+  if (!profile || !review?.model) return undefined;
+  const configuredModel = (profile.settings as Record<string, string | undefined>)[`${profile.provider}_model`];
+  return configuredModel === review.model ? review : undefined;
+}
+
+function defaultGeneralReviewComment(author?: string, naturalStyle = false) {
+  return `Thanks${author ? ` @${author}` : ""} for the work on this!${naturalStyle ? "" : " Review done using AI tools; inline comments below."}`;
+}
+
+function naturalGeneralReviewComment(author: string | undefined, summary: string | undefined, comments: ReviewCommentData[] = [], verdict?: string) {
+  const blocking = comments.filter((comment) => comment.severity === "critical" || comment.severity === "warning").length;
+  const minor = comments.filter((comment) => comment.severity === "suggestion" || comment.severity === "nitpick").length;
+  const closing = blocking
+    ? `${blocking} blocking finding${blocking === 1 ? "" : "s"} to address.`
+    : minor
+      ? `${minor} minor suggestion${minor === 1 ? "/nit" : "s/nits"}; otherwise LGTM.`
+      : verdict === "approve" ? "LGTM." : "No actionable findings.";
+  return [`Thanks${author ? ` @${author}` : ""} for the contribution!`, summary?.trim(), closing].filter(Boolean).join(" ");
+}
+
+const MAINTAINER_REVIEW_WORKFLOW_TEMPLATE = `Follow this maintainer review workflow when the necessary context is available:
+- On the first review round, thank the contributor once, summarize the change in a couple of concise sentences, and mention the number of minor suggestions/nits; say “otherwise LGTM” only when no blocking findings remain. If earlier review history shows they were already thanked, do not repeat it.
+- If the PR does not have the ok-to-test label, recommend the standalone comment /ok-to-test before requesting CI.
+- On later review rounds, skip the general comment and report only new, actionable inline findings. Do not repeat resolved or already-reported feedback.
+- If earlier review context shows comments are still unresolved, draft a concise follow-up tagging the contributor and asking whether they have time to address those specific comments. Skip comments already addressed and do not thank them again.
+- When no blocking issues remain, the ok-to-test label is present, and all required PR checks pass, mark the PR ready to merge. A concise final reply may thank the contributor (for example, “Thanks for the contribution” or “Great catch”) and include /lgtm and /approve.
+- Do not claim review history, labels, check status, or contributor login unless included in the supplied context. If prior review threads are missing, ask the maintainer to provide them before drafting a follow-up. Draft recommendations only; do not post commands or change GitHub.`;
 
 /* ── Repo rules types ────────────────────────────────────────────────── */
 
@@ -171,6 +274,7 @@ type RepoRuleFile = { path: string; content: string };
 type RepoRulesData = {
     cursor: RepoRuleFile[];
     claude: RepoRuleFile[];
+    agents: RepoRuleFile[];
 };
 
 /* ── Change type badge ───────────────────────────────────────────────── */
@@ -391,6 +495,10 @@ function ReviewCommentsView({
   onUpdateComment,
   onDeleteComment,
   onAddComment,
+  onSubmitComment,
+  submittedCommentUrls,
+  submittingCommentKey,
+  commentSubmitError,
   hiddenSeverities,
   onHiddenSeveritiesChange,
 }: {
@@ -403,6 +511,10 @@ function ReviewCommentsView({
   onUpdateComment: (index: number, c: ReviewCommentData) => void;
   onDeleteComment: (index: number) => void;
   onAddComment: (c: ReviewCommentData) => void;
+  onSubmitComment: (comment: ReviewCommentData, index: number) => void;
+  submittedCommentUrls?: Record<string, string | true>;
+  submittingCommentKey: string | null;
+  commentSubmitError: { key: string; message: string } | null;
   hiddenSeverities: Set<string>;
   onHiddenSeveritiesChange: (next: Set<string>) => void;
 }) {
@@ -585,6 +697,8 @@ function ReviewCommentsView({
               <div className="divide-y divide-slate-100 bg-white/60 dark:divide-slate-800 dark:bg-slate-950/40">
                 {fileComments.map((c, ci) => {
                   const gIdx = comments.indexOf(c);
+                  const submissionKey = reviewCommentKey(c, gIdx);
+                  const submittedUrl = submittedCommentUrls?.[submissionKey];
                   const isEditing = editingIdx === gIdx;
                   const sCfg = SEVERITY_CONFIG[c.severity] ?? SEVERITY_CONFIG.suggestion;
 
@@ -624,9 +738,19 @@ function ReviewCommentsView({
                               {includeCommentHeading ? (
                                 <span className="text-sm font-medium text-slate-900 dark:text-slate-100">{c.title}</span>
                               ) : null}
-                              {c.line ? <span className="text-[11px] text-slate-500">L{c.line}</span> : null}
+                              <code className="text-[11px] text-slate-500">{c.file}:{c.line ? `L${c.line}` : "line unavailable"}</code>
                             </div>
                             <div className="flex flex-none items-center gap-1">
+                              <button
+                                type="button"
+                                className="text-[11px] text-emerald-700 hover:underline disabled:cursor-not-allowed disabled:opacity-40 dark:text-emerald-400"
+                                disabled={!c.line || submittingCommentKey !== null || Boolean(submittedUrl)}
+                                title={!c.line ? "This finding has no changed-line reference; use the combined review submission instead." : undefined}
+                                onClick={() => onSubmitComment(c, gIdx)}
+                              >
+                                {submittingCommentKey === submissionKey ? "Submitting…" : submittedUrl ? "Submitted" : "Submit to PR"}
+                              </button>
+                              <span className="text-slate-300 dark:text-slate-700">|</span>
                               <button
                                 type="button"
                                 className="text-[11px] text-slate-400 hover:text-emerald-600 dark:hover:text-emerald-400"
@@ -647,6 +771,8 @@ function ReviewCommentsView({
                           <div className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
                             <MarkdownBody text={c.body} />
                           </div>
+                          {commentSubmitError?.key === submissionKey ? <p role="alert" className="mt-1 text-xs text-rose-600">{commentSubmitError.message}</p> : null}
+                          {typeof submittedUrl === "string" && submittedUrl ? <a className="mt-1 inline-block text-[11px] text-emerald-700 underline dark:text-emerald-400" href={submittedUrl} target="_blank" rel="noopener noreferrer">View submitted comment</a> : null}
                           {c.existing_code ? (
                             <div className="mt-2">
                               <div className="flex items-center justify-between gap-2">
@@ -857,6 +983,48 @@ function summarizeReviews(reviews: ReviewItem[]) {
   return { approved, changes, commented, participants: latestByUser.size };
 }
 
+function reviewLifecycle(pull: PullRow) {
+  const latestByReviewer = new Map<string, ReviewItem>();
+  for (const review of [...pull.reviews].sort((a, b) => Date.parse(a.submitted_at ?? "") - Date.parse(b.submitted_at ?? ""))) {
+    const reviewer = review.user?.login;
+    if (!reviewer || reviewer === pull.author || !review.submitted_at) continue;
+    if (review.state === "DISMISSED") latestByReviewer.delete(reviewer);
+    else latestByReviewer.set(reviewer, review);
+  }
+  const latestReviews = [...latestByReviewer.values()].sort((a, b) => Date.parse(b.submitted_at!) - Date.parse(a.submitted_at!));
+  const latest = latestReviews[0];
+  const requested = (pull.requested_reviewers?.length ?? 0) + (pull.requested_teams?.length ?? 0) > 0;
+  const updatedSinceReview = Boolean(latest?.commit_id && pull.head_sha && latest.commit_id !== pull.head_sha);
+  const changesRequestedOnHead = latestReviews.some((review) => review.state === "CHANGES_REQUESTED" && (!review.commit_id || !pull.head_sha || review.commit_id === pull.head_sha));
+  const unresolvedThreads = pull.reviewThreads?.unresolved ?? 0;
+
+  if (changesRequestedOnHead) {
+    return { label: "Waiting on author", title: "The latest changes-requested review is on the current PR head." };
+  }
+  if (unresolvedThreads > 0) {
+    return { label: "Reviewed · author action", title: `${unresolvedThreads} unresolved inline review ${unresolvedThreads === 1 ? "thread" : "threads"} remain.` };
+  }
+  if (requested) {
+    return { label: updatedSinceReview ? "Re-review requested" : "Review requested", title: "GitHub has one or more outstanding reviewer requests." };
+  }
+  if (updatedSinceReview) {
+    return { label: latest?.state === "CHANGES_REQUESTED" ? "Author updated · review needed" : "Updated since review", title: "The PR head has commits newer than the latest submitted maintainer review." };
+  }
+  if ((pull.reviewThreads?.total ?? 0) > 0 && unresolvedThreads === 0) {
+    return { label: "Review threads resolved", title: "All inline review threads are marked resolved on GitHub." };
+  }
+  if (latest?.state === "APPROVED") {
+    return { label: "Reviewed · approved", title: "The latest submitted maintainer review approved the current PR head." };
+  }
+  if (latest?.state === "CHANGES_REQUESTED") {
+    return { label: "Waiting on author", title: "The latest changes-requested review is on the current PR head." };
+  }
+  if (latest?.state === "COMMENTED") {
+    return { label: "Reviewed · comments", title: "The latest submitted maintainer review left comments on the current PR head." };
+  }
+  return { label: "Needs review", title: "No submitted maintainer review or outstanding reviewer request was found." };
+}
+
 // ---------- Metrics Panel ----------
 
 type MetricsData = {
@@ -867,11 +1035,12 @@ type MetricsData = {
   sizeDistribution: Array<{ size: string; count: number }>;
 };
 
-function MetricsPanel({ owner, repo }: { owner: string; repo: string }) {
+function MetricsPanel({ owner, repo, days, onDaysChange }: { owner: string; repo: string; days: number; onDaysChange: (days: number) => void }) {
   const [metricsData, setMetricsData] = useState<MetricsData | null>(null);
   const [metricsLoading, setMetricsLoading] = useState(false);
   const [metricsError, setMetricsError] = useState<string | null>(null);
-  const [days, setDays] = useState(30);
+  const queryKey = JSON.stringify([owner, repo, days]);
+  const [cachedQueryKey, setCachedQueryKey] = useState<string | null>(null);
 
   const fetchMetrics = useCallback(async () => {
     if (!owner || !repo) return;
@@ -882,16 +1051,31 @@ function MetricsPanel({ owner, repo }: { owner: string; repo: string }) {
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? `Failed to load metrics (${res.status})`);
       setMetricsData(json as MetricsData);
+      setCachedQueryKey(queryKey);
     } catch (e) {
       setMetricsError(e instanceof Error ? e.message : "Failed to load metrics");
     } finally {
       setMetricsLoading(false);
     }
-  }, [owner, repo, days]);
+  }, [owner, repo, days, queryKey]);
 
   useEffect(() => {
+    if (cachedQueryKey === queryKey) return;
+    try {
+      const cached = JSON.parse(sessionStorage.getItem(METRICS_CACHE_SESSION_KEY) ?? "null") as { queryKey?: string; data?: MetricsData } | null;
+      if (cached?.queryKey === queryKey && cached.data) {
+        setMetricsData(cached.data);
+        setCachedQueryKey(queryKey);
+        return;
+      }
+    } catch { /* Cached metrics are optional when browser storage is unavailable. */ }
     void fetchMetrics();
-  }, [fetchMetrics]);
+  }, [fetchMetrics, queryKey, cachedQueryKey]);
+
+  useEffect(() => {
+    if (cachedQueryKey !== queryKey || !metricsData) return;
+    try { sessionStorage.setItem(METRICS_CACHE_SESSION_KEY, JSON.stringify({ queryKey, data: metricsData })); } catch { /* Cached metrics are optional when browser storage is unavailable. */ }
+  }, [cachedQueryKey, queryKey, metricsData]);
 
   if (metricsLoading) {
     return (
@@ -940,7 +1124,7 @@ function MetricsPanel({ owner, repo }: { owner: string; repo: string }) {
           <select
             className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs outline-none ring-violet-500/40 focus:ring-2 dark:border-slate-700 dark:bg-slate-950"
             value={days}
-            onChange={(e) => setDays(Number(e.target.value))}
+            onChange={(e) => onDaysChange(Number(e.target.value))}
           >
             <option value={7}>7 days</option>
             <option value={14}>14 days</option>
@@ -1009,21 +1193,45 @@ function MetricsPanel({ owner, repo }: { owner: string; repo: string }) {
 // ---------- Dashboard ----------
 
 export function Dashboard() {
+  const [view, setView] = useState<RepositoryView>("pulls");
+  const [viewRestored, setViewRestored] = useState(false);
   const [repoInput, setRepoInput] = useState("");
   const [owner, setOwner] = useState("");
   const [repo, setRepo] = useState("");
-  const [state, setState] = useState<"open" | "closed" | "all">("open");
-  const [perPage, setPerPage] = useState(10);
+  const [prState, setPrState] = useState<RepositoryState>("open");
+  const [prPerPage, setPrPerPage] = useState(10);
+  const [issuesState, setIssuesState] = useState<RepositoryState>("open");
+  const [issuesPerPage, setIssuesPerPage] = useState(10);
+  const [milestonesState, setMilestonesState] = useState<RepositoryState>("open");
+  const [milestonesPerPage, setMilestonesPerPage] = useState(10);
+  const [metricsDays, setMetricsDays] = useState(30);
+  const [naturalReview, setNaturalReview] = useState(false);
+  const [githubMcpReviewContext, setGithubMcpReviewContext] = useState(false);
   const [page, setPage] = useState(1);
 
   const { aiMode } = useAiMode();
-  const { metrics: metricsMode } = useMetrics();
+  const { user, loading: authLoading } = useAuth();
 
   const [bookmarks, setBookmarks] = useState<RepoBookmark[]>([]);
   const [showBookmarks, setShowBookmarks] = useState(false);
   const bookmarkMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => { setBookmarks(loadBookmarks()); }, []);
+
+  useEffect(() => { setGithubMcpReviewContext(loadGithubMcpReviewContext()); }, []);
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("gitrack:maintainer-view");
+      if (saved === "pulls" || saved === "issues" || saved === "milestones" || saved === "rules" || saved === "metrics") setView(saved);
+    } catch { /* Remembered tab is optional when browser storage is disabled. */ }
+    setViewRestored(true);
+  }, []);
+
+  useEffect(() => {
+    if (!viewRestored) return;
+    try { localStorage.setItem("gitrack:maintainer-view", view); } catch { /* Remembered tab is optional when browser storage is disabled. */ }
+  }, [view, viewRestored]);
 
   useEffect(() => {
     if (!showBookmarks) return;
@@ -1043,16 +1251,15 @@ export function Dashboard() {
     [bookmarks, owner, repo],
   );
 
-  const applyRepoInput = useCallback((input: string) => {
-    const parsed = parseRepoInput(input);
-    if (parsed) {
-      setOwner(parsed.owner);
-      setRepo(parsed.repo);
-      setRepoInput(`${parsed.owner}/${parsed.repo}`);
-      return true;
-    }
-    return false;
-  }, []);
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      const parsed = parseRepoInput(repoInput);
+      setOwner(parsed?.owner ?? "");
+      setRepo(parsed?.repo ?? "");
+      setPage(1);
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [repoInput]);
 
   const handleToggleBookmark = useCallback(() => {
     if (!owner || !repo) return;
@@ -1071,7 +1278,17 @@ export function Dashboard() {
   }, []);
 
   const [priorityView, setPriorityView] = useState<PriorityView>("all");
+  const [maintainerQueue, setMaintainerQueue] = useState<"needsReview" | "needsChanges" | "waitingOnChecks" | null>(null);
+  const [issueFilter, setIssueFilter] = useState<IssueFilter>("all");
+  const [issueSearch, setIssueSearch] = useState("");
   const [prioritySort, setPrioritySort] = useState<PrioritySort>("updatedDesc");
+  const [prAuthorFilter, setPrAuthorFilter] = useState("");
+  const [prSizeFilter, setPrSizeFilter] = useState("");
+  const [issueAuthor, setIssueAuthor] = useState("");
+  const [issueAssignee, setIssueAssignee] = useState("");
+  const [issueLabel, setIssueLabel] = useState("");
+  const [issueMilestone, setIssueMilestone] = useState("");
+  const [issueSort, setIssueSort] = useState<IssueSort>("updatedDesc");
   const [search, setSearch] = useState("");
   const [reviewerFilter, setReviewerFilter] = useState("");
 
@@ -1082,23 +1299,164 @@ export function Dashboard() {
   >({});
 
   const [data, setData] = useState<PrsResponse | null>(null);
+  const [dataForRepo, setDataForRepo] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [sessionRestored, setSessionRestored] = useState(false);
+
+  const currentRepoKey = `${owner.trim()}/${repo.trim()}`.toLowerCase();
+  const dataMatchesCurrentRepo = Boolean(data && dataForRepo?.toLowerCase() === currentRepoKey);
+
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem(DASHBOARD_SESSION_KEY);
+      if (raw) {
+        const saved = JSON.parse(raw) as Partial<DashboardSessionState>;
+        if (saved.view === "pulls" || saved.view === "issues" || saved.view === "milestones" || saved.view === "rules" || saved.view === "metrics") setView(saved.view);
+        if (typeof saved.repoInput === "string") setRepoInput(saved.repoInput);
+        if (typeof saved.owner === "string") setOwner(saved.owner);
+        if (typeof saved.repo === "string") setRepo(saved.repo);
+        const validState = (value: unknown): value is RepositoryState => value === "open" || value === "closed" || value === "all";
+        if (validState(saved.prState ?? saved.state)) setPrState((saved.prState ?? saved.state)!);
+        if (validState(saved.issuesState ?? saved.state)) setIssuesState((saved.issuesState ?? saved.state)!);
+        if (validState(saved.milestonesState ?? saved.state)) setMilestonesState((saved.milestonesState ?? saved.state)!);
+        if ([5, 10, 20, 30].includes(saved.prPerPage ?? saved.perPage ?? 0)) setPrPerPage((saved.prPerPage ?? saved.perPage)!);
+        if ([5, 10, 20, 30].includes(saved.issuesPerPage ?? saved.perPage ?? 0)) setIssuesPerPage((saved.issuesPerPage ?? saved.perPage)!);
+        if ([5, 10, 20, 30].includes(saved.milestonesPerPage ?? saved.perPage ?? 0)) setMilestonesPerPage((saved.milestonesPerPage ?? saved.perPage)!);
+        if ([7, 14, 30, 60, 90].includes(saved.metricsDays ?? 0)) setMetricsDays(saved.metricsDays!);
+        if (typeof saved.naturalReview === "boolean") setNaturalReview(saved.naturalReview);
+        if (Number.isInteger(saved.page) && saved.page! > 0) setPage(saved.page!);
+        if (["all", "reviewReady", "needsChanges", "blocked", "waitingOnChecks", "draft", "needsReview", "reviewRequested", "waitingOnAuthor", "approved", "checksFailing", "conflict"].includes(saved.priorityView ?? "")) setPriorityView(saved.priorityView!);
+        if (saved.maintainerQueue === null || saved.maintainerQueue === "needsReview" || saved.maintainerQueue === "needsChanges" || saved.maintainerQueue === "waitingOnChecks") setMaintainerQueue(saved.maintainerQueue);
+        if (saved.issueFilter && ["all", "needs-triage", "unassigned", "no-milestone", "no-label", "has-comments"].includes(saved.issueFilter)) setIssueFilter(saved.issueFilter);
+        if (typeof saved.issueSearch === "string") setIssueSearch(saved.issueSearch);
+        if (typeof saved.prAuthorFilter === "string") setPrAuthorFilter(saved.prAuthorFilter);
+        if (typeof saved.prSizeFilter === "string") setPrSizeFilter(saved.prSizeFilter);
+        if (typeof saved.issueAuthor === "string") setIssueAuthor(saved.issueAuthor);
+        if (typeof saved.issueAssignee === "string") setIssueAssignee(saved.issueAssignee);
+        if (typeof saved.issueLabel === "string") setIssueLabel(saved.issueLabel);
+        if (typeof saved.issueMilestone === "string") setIssueMilestone(saved.issueMilestone);
+        const validPrSorts: PrioritySort[] = ["updatedDesc", "updatedAsc", "createdDesc", "createdAsc", "popularity", "longRunning", "readyFirst", "largestDiff", "smallestDiff", "mostComments", "mostCommits", "recentActivity", "oldestActivity", "highestReadiness", "lowestReadiness"];
+        const savedPrioritySort = saved.prioritySort as string | undefined;
+        if (savedPrioritySort === "oldestUpdated") setPrioritySort("updatedAsc");
+        else if (savedPrioritySort && validPrSorts.includes(savedPrioritySort as PrioritySort)) setPrioritySort(savedPrioritySort as PrioritySort);
+        const validIssueSorts: IssueSort[] = ["updatedDesc", "updatedAsc", "createdDesc", "createdAsc", "commentsDesc", "commentsAsc"];
+        if (saved.issueSort && validIssueSorts.includes(saved.issueSort)) setIssueSort(saved.issueSort);
+        if (typeof saved.search === "string") setSearch(saved.search);
+        if (typeof saved.reviewerFilter === "string") setReviewerFilter(saved.reviewerFilter);
+        if (saved.data && Array.isArray(saved.data.pulls) && saved.data.pagination && typeof saved.dataForRepo === "string" && saved.dataForRepo.toLowerCase() === `${saved.owner}/${saved.repo}`.toLowerCase()) {
+          setData(saved.data);
+          setDataForRepo(saved.dataForRepo);
+        }
+      }
+    } catch {
+      try { sessionStorage.removeItem(DASHBOARD_SESSION_KEY); } catch { /* Session storage is optional. */ }
+    }
+    setSessionRestored(true);
+  }, []);
+
+  useEffect(() => {
+    if (!sessionRestored) return;
+    const saved: DashboardSessionState = {
+      view, repoInput, owner, repo, prState, prPerPage, issuesState, issuesPerPage, milestonesState, milestonesPerPage, metricsDays, naturalReview, page, priorityView,
+      maintainerQueue, issueFilter, issueSearch, prioritySort, prAuthorFilter, prSizeFilter, issueAuthor, issueAssignee, issueLabel, issueMilestone, issueSort, search, reviewerFilter, data,
+      dataForRepo,
+    };
+    try { sessionStorage.setItem(DASHBOARD_SESSION_KEY, JSON.stringify(saved)); } catch { /* Cached dashboard state is optional when storage is unavailable. */ }
+  }, [sessionRestored, view, repoInput, owner, repo, prState, prPerPage, issuesState, issuesPerPage, milestonesState, milestonesPerPage, metricsDays, naturalReview, page, priorityView, maintainerQueue, issueFilter, issueSearch, prioritySort, prAuthorFilter, prSizeFilter, issueAuthor, issueAssignee, issueLabel, issueMilestone, issueSort, search, reviewerFilter, dataForRepo, data]);
 
   const [reviewOpenFor, setReviewOpenFor] = useState<number | null>(null);
+  const [reviewDataFor, setReviewDataFor] = useState<number | null>(null);
+  const [reviewProfileIdFor, setReviewProfileIdFor] = useState("");
   const [reviewLoadingFor, setReviewLoadingFor] = useState<number | null>(null);
   const [reviewError, setReviewError] = useState<string | null>(null);
   const [reviewData, setReviewData] = useState<ReviewData | null>(null);
+  const [fixPromptCopied, setFixPromptCopied] = useState(false);
+  const [reviewCache, setReviewCache] = useState<Record<string, ReviewData>>({});
+  const [reviewCacheRestored, setReviewCacheRestored] = useState(false);
   const [hiddenSeverities, setHiddenSeverities] = useState<Set<string>>(new Set());
   const [includeCommentHeading, setIncludeCommentHeading] = useState(true);
   const [reviewPrompt, setReviewPrompt] = useState("");
   const [submitLoading, setSubmitLoading] = useState(false);
   const [submitResult, setSubmitResult] = useState<{ success: boolean; url?: string; error?: string } | null>(null);
+  const [submittingCommentKey, setSubmittingCommentKey] = useState<string | null>(null);
+  const [commentSubmitError, setCommentSubmitError] = useState<{ key: string; message: string } | null>(null);
+
+  useEffect(() => {
+    try {
+      const cached = JSON.parse(sessionStorage.getItem(REVIEW_CACHE_SESSION_KEY) ?? "{}") as Record<string, ReviewData>;
+      if (cached && typeof cached === "object" && !Array.isArray(cached)) setReviewCache(cached);
+    } catch { /* Cached AI reviews are optional when browser storage is unavailable. */ }
+    setReviewCacheRestored(true);
+  }, []);
+
+  useEffect(() => {
+    if (!reviewCacheRestored) return;
+    try { sessionStorage.setItem(REVIEW_CACHE_SESSION_KEY, JSON.stringify(reviewCache)); } catch { /* Cached AI reviews are optional when browser storage is unavailable. */ }
+  }, [reviewCacheRestored, reviewCache]);
+
+  useEffect(() => {
+    if (reviewDataFor === null || !reviewData) return;
+    const key = reviewCacheKey(owner, repo, reviewDataFor, naturalReview, reviewProfileIdFor, githubMcpReviewContext);
+    setReviewCache((current) => {
+      if (current[key] === reviewData) return current;
+      const next = { ...current };
+      delete next[key];
+      next[key] = reviewData;
+      const entries = Object.entries(next);
+      return Object.fromEntries(entries.slice(-15));
+    });
+  }, [reviewDataFor, reviewProfileIdFor, reviewData, owner, repo, naturalReview, githubMcpReviewContext]);
 
   useEffect(() => { setIncludeCommentHeading(loadReviewCommentHeading()); }, []);
   useEffect(() => {
     if (reviewOpenFor !== null) setIncludeCommentHeading(loadReviewCommentHeading());
   }, [reviewOpenFor]);
+
+  const [reviewProviderProfiles, setReviewProviderProfiles] = useState<ProviderProfile[]>([]);
+  const [activeReviewProfileId, setActiveReviewProfileId] = useState("");
+  const [providerProfileError, setProviderProfileError] = useState<string | null>(null);
+  const [linkedIssues, setLinkedIssues] = useState<LinkedIssue[]>([]);
+  const [linkedIssuesLoading, setLinkedIssuesLoading] = useState(false);
+  const [linkedIssuesError, setLinkedIssuesError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const { value, error } = readProviderProfiles();
+    setReviewProviderProfiles(value.profiles);
+    setActiveReviewProfileId(value.activeProfileId ?? value.profiles[0]?.id ?? "");
+    setProviderProfileError(error);
+  }, []);
+
+  useEffect(() => {
+    if (reviewOpenFor === null) return;
+    const { value, error } = readProviderProfiles();
+    setReviewProviderProfiles(value.profiles);
+    setActiveReviewProfileId(value.activeProfileId ?? value.profiles[0]?.id ?? "");
+    setProviderProfileError(error);
+  }, [reviewOpenFor]);
+
+  useEffect(() => {
+    if (reviewOpenFor === null || !owner.trim() || !repo.trim()) {
+      setLinkedIssues([]);
+      setLinkedIssuesError(null);
+      setLinkedIssuesLoading(false);
+      return;
+    }
+    let active = true;
+    setLinkedIssues([]);
+    setLinkedIssuesError(null);
+    setLinkedIssuesLoading(true);
+    fetch(`/api/prs/${reviewOpenFor}/linked-issues?owner=${encodeURIComponent(owner.trim())}&repo=${encodeURIComponent(repo.trim())}`)
+      .then(async (res) => {
+        const json = await res.json() as { issues?: LinkedIssue[]; error?: string };
+        if (!res.ok) throw new Error(json.error ?? `Could not load linked issues (${res.status})`);
+        return json.issues ?? [];
+      })
+      .then((issues) => { if (active) setLinkedIssues(issues); })
+      .catch((error) => { if (active) setLinkedIssuesError(error instanceof Error ? error.message : "Could not load linked issues"); })
+      .finally(() => { if (active) setLinkedIssuesLoading(false); });
+    return () => { active = false; };
+  }, [reviewOpenFor, owner, repo]);
 
   const [assignedReviewers, setAssignedReviewers] = useState<Record<number, string[]>>({});
   const [teamMembers, setTeamMembers] = useState<Record<string, { login: string; avatar_url: string }>>({});
@@ -1109,18 +1467,22 @@ export function Dashboard() {
   const [showSaveInput, setShowSaveInput] = useState(false);
 
   const [repoRules, setRepoRules] = useState<RepoRulesData | null>(null);
+  const [repoRulesFor, setRepoRulesFor] = useState<string | null>(null);
   const [repoRulesLoading, setRepoRulesLoading] = useState(false);
   const [repoRulesError, setRepoRulesError] = useState<string | null>(null);
   const [selectedRulePaths, setSelectedRulePaths] = useState<Set<string>>(new Set());
   const [showRepoRules, setShowRepoRules] = useState(false);
 
-  const canLoad = owner.trim() && repo.trim();
+  const hasRepo = Boolean(owner.trim() && repo.trim());
+  const canLoad = hasRepo && !authLoading && Boolean(user);
+  const rulesRepoKey = `${owner.trim()}/${repo.trim()}`.toLowerCase();
+  const rulesRepoKeyRef = useRef(rulesRepoKey);
+  rulesRepoKeyRef.current = rulesRepoKey;
 
   useEffect(() => {
     if (!aiMode) {
       setDetailsOpenFor(null);
       setReviewOpenFor(null);
-      setReviewData(null);
       setReviewError(null);
     }
   }, [aiMode]);
@@ -1148,32 +1510,37 @@ export function Dashboard() {
 
   const fetchRepoRulesFromGH = useCallback(async () => {
     if (!canLoad) return;
+    const requestRepoKey = `${owner.trim()}/${repo.trim()}`.toLowerCase();
     setRepoRulesLoading(true);
     setRepoRulesError(null);
+    if (repoRulesFor !== requestRepoKey) {
+      setRepoRules(null);
+      setSelectedRulePaths(new Set());
+    }
+    setRepoRulesFor(requestRepoKey);
     try {
-      const res = await fetch(
-        `/api/repo-rules?owner=${encodeURIComponent(owner.trim())}&repo=${encodeURIComponent(repo.trim())}`,
-        { headers: getSessionHeaders() },
-      );
+      const res = await fetch(`/api/repo-rules?owner=${encodeURIComponent(owner.trim())}&repo=${encodeURIComponent(repo.trim())}`);
       if (!res.ok) {
         const json = (await res.json()) as { error?: string };
         throw new Error(json.error ?? `Failed to fetch repo rules (${res.status})`);
       }
       const json = (await res.json()) as { rules: RepoRulesData };
-      setRepoRules(json.rules);
+      if (requestRepoKey === rulesRepoKeyRef.current) setRepoRules(json.rules);
     } catch (e) {
-      setRepoRulesError(e instanceof Error ? e.message : "Failed to fetch repo rules");
-      setRepoRules(null);
+      if (requestRepoKey === rulesRepoKeyRef.current) {
+        setRepoRulesError(e instanceof Error ? e.message : "Failed to fetch repo rules");
+      }
     } finally {
       setRepoRulesLoading(false);
     }
-  }, [canLoad, owner, repo]);
+  }, [canLoad, owner, repo, repoRulesFor]);
 
   const allRuleFiles = useMemo(() => {
     if (!repoRules) return [];
     return [
       ...repoRules.cursor.map((r) => ({ ...r, source: "cursor" as const })),
       ...repoRules.claude.map((r) => ({ ...r, source: "claude" as const })),
+      ...repoRules.agents.map((r) => ({ ...r, source: "agents" as const })),
     ];
   }, [repoRules]);
 
@@ -1206,7 +1573,7 @@ export function Dashboard() {
   }, [allRuleFiles]);
 
   const fetchPrs = useCallback(
-    async (targetPage: number, searchQuery?: string) => {
+    async (targetPage: number, searchQuery?: string, queue: "needsReview" | "needsChanges" | "waitingOnChecks" | null = maintainerQueue) => {
       if (!canLoad) return;
       setLoading(true);
       setError(null);
@@ -1215,41 +1582,51 @@ export function Dashboard() {
           owner: owner.trim(),
           repo: repo.trim(),
           page: String(targetPage),
-          perPage: String(perPage),
-          state,
+          perPage: String(prPerPage),
+          state: prState,
         });
+        const serverSort = prioritySort === "createdDesc" || prioritySort === "createdAsc" ? "created"
+          : prioritySort === "popularity" ? "popularity"
+            : prioritySort === "longRunning" ? "long-running" : "updated";
+        const serverDirection = prioritySort === "updatedAsc" || prioritySort === "createdAsc" ? "asc" : "desc";
+        q.set("sort", serverSort);
+        q.set("direction", serverDirection);
         if (searchQuery) q.set("search", searchQuery);
-        const res = await fetch(`/api/prs?${q.toString()}`, { headers: getSessionHeaders() });
+        if (queue) q.set("queue", queue);
+        const res = await fetch(`/api/prs?${q.toString()}`);
         const json = (await res.json()) as PrsResponse & { error?: string };
         if (!res.ok) {
           throw new Error(json.error ?? `Request failed (${res.status})`);
         }
         setData(json);
-        if (!searchQuery) setPage(targetPage);
+        setDataForRepo(`${owner.trim()}/${repo.trim()}`);
+        setPage(targetPage);
       } catch (e) {
         setData(null);
+        setDataForRepo(null);
         setError(e instanceof Error ? e.message : "Failed to load PRs");
       } finally {
         setLoading(false);
       }
     },
-    [canLoad, owner, repo, perPage, state],
+    [canLoad, owner, repo, prPerPage, prState, maintainerQueue, prioritySort],
   );
 
   useEffect(() => {
-    if (data && canLoad) {
-      refreshSavedRules();
+    if (!canLoad || !(view === "rules" || dataMatchesCurrentRepo)) return;
+    refreshSavedRules();
+    if (repoRulesFor !== rulesRepoKey) {
       void fetchRepoRulesFromGH();
     }
-  }, [data, canLoad, refreshSavedRules, fetchRepoRulesFromGH]);
+  }, [view, dataMatchesCurrentRepo, canLoad, repoRulesFor, rulesRepoKey, refreshSavedRules, fetchRepoRulesFromGH]);
 
   useEffect(() => {
+    if (!sessionRestored || view !== "pulls" || !canLoad) return;
     const q = search.trim();
-    if (!q || !canLoad) return;
-    setReviewerFilter("");
-    const timer = setTimeout(() => void fetchPrs(1, q), 400);
+    if (q) setReviewerFilter("");
+    const timer = setTimeout(() => void fetchPrs(page, q || undefined), q ? 400 : 0);
     return () => clearTimeout(timer);
-  }, [search, canLoad, fetchPrs]);
+  }, [sessionRestored, view, canLoad, owner, repo, prState, prPerPage, page, maintainerQueue, search, fetchPrs]);
 
   const fetchAssignments = useCallback(async (pulls: PullRow[]) => {
     if (!canLoad || pulls.length === 0) return;
@@ -1294,27 +1671,58 @@ export function Dashboard() {
   }, [canLoad, owner, repo]);
 
   useEffect(() => {
-    if (data?.pulls && canLoad) {
+    if (dataMatchesCurrentRepo && data?.pulls && canLoad) {
       void fetchAssignments(data.pulls);
       void fetchTeamMembers();
     }
-  }, [data, canLoad, fetchAssignments, fetchTeamMembers]);
+  }, [dataMatchesCurrentRepo, data, canLoad, fetchAssignments, fetchTeamMembers]);
 
-  const runReview = async (number: number) => {
-    if (!canLoad || !aiMode) return;
+  const runReview = async (number: number, regenerate = false) => {
+    if (!canLoad || !dataMatchesCurrentRepo || !aiMode) return;
+    if (reviewLoadingFor === number) { setReviewOpenFor(number); return; }
+    const profiles = readProviderProfiles().value;
+    const profileId = profiles.activeProfileId ?? activeReviewProfileId;
+    const profile = profiles.profiles.find((item) => item.id === profileId);
+    const key = reviewCacheKey(owner, repo, number, naturalReview, profileId, githubMcpReviewContext);
+    const pull = data?.pulls.find((item) => item.number === number);
+    let cached: ReviewData | undefined = reviewCache[key] ?? readPersistedReviewCacheEntry(key);
+    if (!cached && !githubMcpReviewContext) {
+      const legacyKey = reviewCacheKey(owner, repo, number, naturalReview);
+      const legacy = reviewCache[legacyKey] ?? readPersistedReviewCacheEntry(legacyKey);
+      cached = legacyReviewForProfile(legacy, profile);
+      if (cached) {
+        persistReviewCacheEntry(key, cached);
+        setReviewCache((current) => ({ ...current, [key]: cached! }));
+      }
+    }
+    const cachedHeadIsCurrent = Boolean(cached?.reviewedHeadSha && pull?.head_sha && cached.reviewedHeadSha === pull.head_sha);
+    if (!cachedHeadIsCurrent) cached = undefined;
     setReviewOpenFor(number);
-    setReviewLoadingFor(number);
+    setReviewDataFor(number);
+    setReviewProfileIdFor(profileId);
+    setActiveReviewProfileId(profileId);
     setReviewError(null);
-    setReviewData(null);
     setHiddenSeverities(new Set());
     setSubmitResult(null);
+    setCommentSubmitError(null);
+    if (!regenerate && cached) {
+      const author = pull?.author;
+      if (naturalReview && (!cached.generalComment || cached.generalComment === defaultGeneralReviewComment(author) || cached.generalComment === defaultGeneralReviewComment(author, true))) {
+        cached = { ...cached, generalComment: naturalGeneralReviewComment(author, cached.summary, cached.comments, cached.verdict) };
+      }
+      setReviewData(cached);
+      setReviewLoadingFor(null);
+      return;
+    }
+    setReviewData(cached ?? null);
+    setReviewLoadingFor(number);
     try {
-      const payload: Record<string, unknown> = { owner: owner.trim(), repo: repo.trim(), number };
+      const payload: Record<string, unknown> = { owner: owner.trim(), repo: repo.trim(), number, naturalReview, githubMcpContext: githubMcpReviewContext };
       if (reviewPrompt.trim()) payload.customPrompt = reviewPrompt.trim();
       if (selectedRulesText) payload.repoRulesContext = selectedRulesText;
       const res = await fetch("/api/review", {
         method: "POST",
-        headers: { "content-type": "application/json", ...getSessionHeaders() },
+        headers: { "content-type": "application/json", ...buildLlmHeaders() },
         body: JSON.stringify(payload),
       });
       const contentType = res.headers.get("content-type") ?? "";
@@ -1327,18 +1735,34 @@ export function Dashboard() {
         comments?: ReviewCommentData[];
         markdown?: string;
         model?: string;
+        mergeReadinessScore?: number;
+        mergeReadinessReason?: string;
+        reviewedHeadSha?: string;
+        warning?: string;
+        githubMcpContextLoaded?: boolean;
         error?: string;
       };
       if (!res.ok) {
         throw new Error(json.error ?? `Review failed (${res.status})`);
       }
-      setReviewData({
+      const result: ReviewData = {
         summary: json.summary,
+        generalComment: naturalReview
+          ? naturalGeneralReviewComment(data?.pulls.find((pull) => pull.number === number)?.author, json.summary, json.comments, json.verdict)
+          : defaultGeneralReviewComment(data?.pulls.find((pull) => pull.number === number)?.author),
         verdict: json.verdict,
         comments: json.comments,
         markdown: json.markdown,
         model: json.model,
-      });
+        mergeReadinessScore: json.mergeReadinessScore,
+        mergeReadinessReason: json.mergeReadinessReason,
+        reviewedHeadSha: json.reviewedHeadSha,
+        warning: json.warning,
+        githubMcpContextLoaded: json.githubMcpContextLoaded,
+      };
+      persistReviewCacheEntry(key, result);
+      setReviewCache((current) => ({ ...current, [key]: result }));
+      setReviewData(result);
     } catch (e) {
       setReviewError(e instanceof Error ? e.message : "Review failed");
     } finally {
@@ -1346,27 +1770,30 @@ export function Dashboard() {
     }
   };
 
-  const visibleReviewComments = useMemo(
-    () => (reviewData?.comments ?? []).filter((c) => !hiddenSeverities.has(c.severity)),
+  const visibleReviewEntries = useMemo(
+    () => (reviewData?.comments ?? []).flatMap((comment, index) => hiddenSeverities.has(comment.severity) ? [] : [{ comment, index, key: reviewCommentKey(comment, index) }]),
     [reviewData?.comments, hiddenSeverities],
   );
+  const visibleReviewComments = visibleReviewEntries.map(({ comment }) => comment);
+  const commentsToSubmit = visibleReviewEntries.filter(({ key }) => !reviewData?.submittedCommentUrls?.[key]);
 
+  const reviewPullAuthor = data?.pulls.find((pull) => pull.number === reviewOpenFor)?.author;
   const submitReviewToPr = async () => {
-    if (!reviewOpenFor || !visibleReviewComments.length) return;
+    if (!reviewOpenFor || !commentsToSubmit.length) return;
     setSubmitLoading(true);
     setSubmitResult(null);
     try {
       const res = await fetch("/api/review/submit", {
         method: "POST",
-        headers: { "content-type": "application/json", ...getSessionHeaders() },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({
           owner: owner.trim(),
           repo: repo.trim(),
           number: reviewOpenFor,
-          summary: reviewData?.summary,
+          summary: reviewData?.generalComment ?? defaultGeneralReviewComment(reviewPullAuthor, naturalReview),
           verdict: reviewData?.verdict,
-          comments: visibleReviewComments,
-          includeCommentHeading,
+          comments: commentsToSubmit.map(({ comment }) => comment),
+          includeCommentHeading: includeCommentHeading && !naturalReview,
         }),
       });
       const json = (await res.json()) as { success?: boolean; url?: string; error?: string };
@@ -1374,6 +1801,19 @@ export function Dashboard() {
         throw new Error(json.error ?? `Failed to submit review (${res.status})`);
       }
       setSubmitResult({ success: true, url: json.url });
+      const updatedReview = reviewData ? {
+        ...reviewData,
+        submittedCommentUrls: {
+          ...reviewData.submittedCommentUrls,
+          ...Object.fromEntries(commentsToSubmit.map(({ key }) => [key, json.url ?? (true as const)])),
+        },
+      } : null;
+      if (updatedReview && reviewOpenFor !== null) {
+        const key = reviewCacheKey(owner, repo, reviewOpenFor, naturalReview, reviewProfileIdFor, githubMcpReviewContext);
+        persistReviewCacheEntry(key, updatedReview);
+        setReviewCache((current) => ({ ...current, [key]: updatedReview }));
+        setReviewData(updatedReview);
+      }
     } catch (e) {
       setSubmitResult({ success: false, error: e instanceof Error ? e.message : "Failed to submit review" });
     } finally {
@@ -1381,44 +1821,76 @@ export function Dashboard() {
     }
   };
 
+  const submitReviewComment = async (comment: ReviewCommentData, index: number) => {
+    if (!reviewOpenFor || !comment.line || submittingCommentKey) return;
+    const key = reviewCommentKey(comment, index);
+    if (reviewData?.submittedCommentUrls?.[key]) return;
+    setSubmittingCommentKey(key);
+    setCommentSubmitError(null);
+    setSubmitResult(null);
+    try {
+      const res = await fetch("/api/review/submit", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          owner: owner.trim(),
+          repo: repo.trim(),
+          number: reviewOpenFor,
+          summary: "",
+          verdict: "comment",
+          comments: [comment],
+          includeCommentHeading: includeCommentHeading && !naturalReview,
+          requireInline: true,
+        }),
+      });
+      const json = await res.json() as { success?: boolean; url?: string; error?: string };
+      if (!res.ok) throw new Error(json.error ?? `Failed to submit comment (${res.status})`);
+      if (reviewData && reviewOpenFor !== null) {
+        const updatedReview: ReviewData = {
+          ...reviewData,
+          submittedCommentUrls: { ...reviewData.submittedCommentUrls, [key]: json.url ?? (true as const) },
+        };
+        const cacheKey = reviewCacheKey(owner, repo, reviewOpenFor, naturalReview, reviewProfileIdFor, githubMcpReviewContext);
+        persistReviewCacheEntry(cacheKey, updatedReview);
+        setReviewCache((current) => ({ ...current, [cacheKey]: updatedReview }));
+        setReviewData(updatedReview);
+      }
+    } catch (e) {
+      setCommentSubmitError({ key, message: e instanceof Error ? e.message : "Failed to submit comment" });
+    } finally {
+      setSubmittingCommentKey(null);
+    }
+  };
+
+  const copyReviewToAgent = async () => {
+    if (!reviewData || reviewOpenFor === null) return;
+    const pull = data?.pulls.find((item) => item.number === reviewOpenFor);
+    const findings = reviewData.comments?.length
+      ? reviewData.comments.map((comment) => [
+          `### ${comment.severity}${naturalReview ? "" : `: ${comment.title}`} (${comment.file}${comment.line ? `:${comment.line}` : ""})`,
+          comment.body,
+          comment.existing_code ? `Current code:\n${"```"}\n${comment.existing_code}\n${"```"}` : "",
+          comment.suggested_code ? `Suggested code:\n${"```"}\n${comment.suggested_code}\n${"```"}` : "",
+        ].filter(Boolean).join("\n\n")).join("\n\n")
+      : reviewData.markdown ?? "No structured findings were returned.";
+    const prompt = [
+      `Resolve the actionable findings from this review for ${owner}/${repo} PR #${reviewOpenFor}${pull?.title ? ` (${pull.title})` : ""} (https://github.com/${owner}/${repo}/pull/${reviewOpenFor}).`,
+      "Read the PR diff and surrounding code first. For each finding, use its file and line reference to locate the code, verify it still applies, then make the smallest correct fix. Treat praise as context, not a task. Preserve unrelated changes, run relevant tests, and report each finding as fixed or explain why it was not changed. Do not post to GitHub.",
+      reviewData.summary ? `Review summary: ${reviewData.summary}` : "",
+      findings,
+    ].filter(Boolean).join("\n\n");
+    try {
+      await navigator.clipboard.writeText(prompt);
+      setFixPromptCopied(true);
+      window.setTimeout(() => setFixPromptCopied(false), 2000);
+    } catch {
+      setReviewError("Could not copy the fix prompt. Check clipboard permissions and try again.");
+    }
+  };
+
   const reviewAllOnPage = async () => {
-    if (!data?.pulls.length) return;
-
-    const all = [...data.pulls];
-    let out = all;
-
-    if (priorityView !== "all") {
-      out = out.filter((p) => {
-        if (priorityView === "reviewReady") return isReviewReady(p);
-        if (priorityView === "needsChanges") return p.readiness.breakdown.changesRequested > 0;
-        if (priorityView === "blocked") return isConflicted(p) || p.checks.failing > 0;
-        if (priorityView === "waitingOnChecks") return p.checks.pending > 0;
-        if (priorityView === "draft") return p.draft;
-        return true;
-      });
-    }
-
-    if (prioritySort === "updatedDesc") {
-      // Keep API ordering (updated desc).
-    } else if (prioritySort === "reviewReadyThenScore") {
-      out.sort((a, b) => {
-        const ar = isReviewReady(a) ? 1 : 0;
-        const br = isReviewReady(b) ? 1 : 0;
-        if (br !== ar) return br - ar;
-        if (b.readiness.score !== a.readiness.score) return b.readiness.score - a.readiness.score;
-        return Date.parse(b.updated_at) - Date.parse(a.updated_at);
-      });
-    } else if (prioritySort === "highestReadiness") {
-      out.sort((a, b) => {
-        if (b.readiness.score !== a.readiness.score) return b.readiness.score - a.readiness.score;
-        return Date.parse(b.updated_at) - Date.parse(a.updated_at);
-      });
-    } else {
-      // oldestUpdated
-      out.sort((a, b) => Date.parse(a.updated_at) - Date.parse(b.updated_at));
-    }
-
-    for (const p of out) {
+    if (!dataMatchesCurrentRepo || !data?.pulls.length) return;
+    for (const p of pullsForTable) {
       await runReview(p.number);
     }
   };
@@ -1430,7 +1902,7 @@ export function Dashboard() {
       try {
         const res = await fetch("/api/glance", {
           method: "POST",
-          headers: { "content-type": "application/json", ...getSessionHeaders() },
+          headers: { "content-type": "application/json", ...buildLlmHeaders() },
           body: JSON.stringify({ owner: owner.trim(), repo: repo.trim(), number }),
         });
         const json = (await res.json()) as {
@@ -1466,7 +1938,7 @@ export function Dashboard() {
       try {
         const res = await fetch("/api/insights", {
           method: "POST",
-          headers: { "content-type": "application/json", ...getSessionHeaders() },
+          headers: { "content-type": "application/json", ...buildLlmHeaders() },
           body: JSON.stringify({ owner: owner.trim(), repo: repo.trim(), number }),
         });
         const json = (await res.json()) as { markdown?: string; error?: string };
@@ -1511,44 +1983,60 @@ export function Dashboard() {
 
     if (priorityView !== "all") {
       out = out.filter((p) => {
+        const lifecycle = reviewLifecycle(p).label;
         if (priorityView === "reviewReady") return isReviewReady(p);
         if (priorityView === "needsChanges") return p.readiness.breakdown.changesRequested > 0;
         if (priorityView === "blocked") return isConflicted(p) || p.checks.failing > 0;
         if (priorityView === "waitingOnChecks") return p.checks.pending > 0;
         if (priorityView === "draft") return p.draft;
+        if (priorityView === "needsReview") return lifecycle === "Needs review" || lifecycle === "Updated since review" || lifecycle === "Author updated · review needed";
+        if (priorityView === "reviewRequested") return Boolean(p.requested_reviewers?.length || p.requested_teams?.length);
+        if (priorityView === "waitingOnAuthor") return lifecycle === "Waiting on author" || lifecycle === "Reviewed · author action";
+        if (priorityView === "approved") return lifecycle === "Reviewed · approved";
+        if (priorityView === "checksFailing") return p.checks.failing > 0;
+        if (priorityView === "conflict") return isConflicted(p);
         return true;
       });
     }
 
+    if (prAuthorFilter.trim()) {
+      const author = prAuthorFilter.trim().toLowerCase();
+      out = out.filter((p) => p.author.toLowerCase().includes(author));
+    }
+    if (prSizeFilter) out = out.filter((p) => prSize(p.additions, p.deletions).label === prSizeFilter);
     if (reviewerFilter) {
       out = out.filter((p) => assignedReviewers[p.number]?.includes(reviewerFilter));
     }
 
-    if (prioritySort === "updatedDesc") return out;
-
-    if (prioritySort === "reviewReadyThenScore") {
+    if (prioritySort === "readyFirst") {
       out.sort((a, b) => {
         const ar = isReviewReady(a) ? 1 : 0;
         const br = isReviewReady(b) ? 1 : 0;
         if (br !== ar) return br - ar;
-        if (b.readiness.score !== a.readiness.score) return b.readiness.score - a.readiness.score;
         return Date.parse(b.updated_at) - Date.parse(a.updated_at);
       });
-      return out;
-    }
-
-    if (prioritySort === "highestReadiness") {
+    } else if (prioritySort === "largestDiff" || prioritySort === "smallestDiff") {
+      out.sort((a, b) => (prioritySort === "largestDiff" ? -1 : 1) * ((a.additions + a.deletions) - (b.additions + b.deletions)));
+    } else if (prioritySort === "mostComments") {
+      out.sort((a, b) => (b.comments + b.review_comments) - (a.comments + a.review_comments));
+    } else if (prioritySort === "mostCommits") {
+      out.sort((a, b) => b.commits - a.commits);
+    } else if (prioritySort === "recentActivity" || prioritySort === "oldestActivity") {
       out.sort((a, b) => {
-        if (b.readiness.score !== a.readiness.score) return b.readiness.score - a.readiness.score;
-        return Date.parse(b.updated_at) - Date.parse(a.updated_at);
+        const diff = Date.parse(a.last_activity_at ?? a.updated_at) - Date.parse(b.last_activity_at ?? b.updated_at);
+        return prioritySort === "recentActivity" ? -diff : diff;
       });
-      return out;
+    } else if (prioritySort === "highestReadiness" || prioritySort === "lowestReadiness") {
+      out.sort((a, b) => {
+        const aScore = reviewCache[reviewCacheKey(owner, repo, a.number, naturalReview, activeReviewProfileId, githubMcpReviewContext)]?.mergeReadinessScore;
+        const bScore = reviewCache[reviewCacheKey(owner, repo, b.number, naturalReview, activeReviewProfileId, githubMcpReviewContext)]?.mergeReadinessScore;
+        if (aScore === undefined) return bScore === undefined ? 0 : 1;
+        if (bScore === undefined) return -1;
+        return prioritySort === "highestReadiness" ? bScore - aScore : aScore - bScore;
+      });
     }
-
-    // oldestUpdated
-    out.sort((a, b) => Date.parse(a.updated_at) - Date.parse(b.updated_at));
     return out;
-  }, [data, prioritySort, priorityView, reviewerFilter, assignedReviewers]);
+  }, [data, prioritySort, priorityView, reviewerFilter, assignedReviewers, prAuthorFilter, prSizeFilter, reviewCache, owner, repo, naturalReview, activeReviewProfileId, githubMcpReviewContext]);
 
   const paginationLabel = useMemo(() => {
     if (!data) return "";
@@ -1561,7 +2049,7 @@ export function Dashboard() {
     <div className="flex flex-col gap-6">
       <section className="rounded-xl border border-slate-200 bg-white/60 p-4 dark:border-slate-800 dark:bg-slate-900/40">
         <div className="grid gap-3 md:grid-cols-6">
-          <div className="relative flex flex-col gap-1 md:col-span-4">
+          <div className="relative flex flex-col gap-1 md:col-span-6">
             <span className="text-xs font-medium uppercase tracking-wide text-slate-500">Repository</span>
             <div className="flex gap-2">
               <div className="relative flex-1">
@@ -1571,12 +2059,6 @@ export function Dashboard() {
                   value={repoInput}
                   onChange={(e) => {
                     setRepoInput(e.target.value);
-                    const parsed = parseRepoInput(e.target.value);
-                    if (parsed) { setOwner(parsed.owner); setRepo(parsed.repo); }
-                    else { setOwner(""); setRepo(""); }
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && canLoad) { setSearch(""); void fetchPrs(1); }
                   }}
                 />
                 {owner && repo && (
@@ -1643,90 +2125,91 @@ export function Dashboard() {
               </div>
             </div>
           </div>
-          <label className="flex flex-col gap-1">
-            <span className="text-xs font-medium uppercase tracking-wide text-slate-500">State</span>
-            <select
-              className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-emerald-500/40 focus:ring-2 dark:border-slate-700 dark:bg-slate-950"
-              value={state}
-              onChange={(e) => setState(e.target.value as typeof state)}
-            >
-              <option value="open">Open</option>
-              <option value="closed">Closed</option>
-              <option value="all">All</option>
-            </select>
-          </label>
-          <label className="flex flex-col gap-1">
-            <span className="text-xs font-medium uppercase tracking-wide text-slate-500">Per page</span>
-            <select
-              className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-emerald-500/40 focus:ring-2 dark:border-slate-700 dark:bg-slate-950"
-              value={String(perPage)}
-              onChange={(e) => {
-                setPerPage(Number(e.target.value));
-                setPage(1);
-              }}
-            >
-              {[5, 10, 20, 30].map((n) => (
-                <option key={n} value={String(n)}>
-                  {n}
-                </option>
-              ))}
-            </select>
-          </label>
         </div>
 
-        <div className="mt-4 flex flex-wrap items-center gap-3">
-          <button
-            type="button"
-            className="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40"
-            disabled={!canLoad || loading}
-            onClick={() => { setSearch(""); void fetchPrs(1); }}
-          >
-            Load PRs
-          </button>
+        {canLoad ? <MaintainerOverview owner={owner.trim()} repo={repo.trim()}
+          onIssues={() => { setView("issues"); setIssuesState("open"); setIssueFilter("needs-triage"); setIssueSearch(""); }}
+          onQueue={(queue) => { setView("pulls"); setPrState("open"); setMaintainerQueue(queue); setPriorityView("all"); setReviewerFilter(""); setPrAuthorFilter(""); setPrSizeFilter(""); setSearch(""); setPage(1); }}
+          onMilestones={() => setView("milestones")}
+        /> : null}
+
+        <nav className="mt-4 flex flex-wrap gap-1 border-b border-slate-200 dark:border-slate-800" aria-label="Repository views" role="tablist" aria-orientation="horizontal" onKeyDown={(e) => {
+          if (!["ArrowRight", "ArrowLeft", "Home", "End"].includes(e.key)) return;
+          e.preventDefault();
+          const tabs: RepositoryView[] = ["pulls", "issues", "milestones", "rules", "metrics"];
+          const current = tabs.indexOf(view);
+          const next = e.key === "Home" ? 0 : e.key === "End" ? tabs.length - 1 : (current + (e.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length;
+          const nextView = tabs[next];
+          setView(nextView);
+          document.getElementById(`repository-tab-${nextView}`)?.focus();
+        }}>
+          {([ ["pulls", "Pull requests"], ["issues", "Issues inbox"], ["milestones", "Milestones"], ["rules", "Review Rules"], ["metrics", "Repository Metrics"] ] as const).map(([key, label]) => (
+            <button key={key} id={`repository-tab-${key}`} type="button" role="tab" aria-controls="repository-view-panel" aria-selected={view === key} tabIndex={view === key ? 0 : -1} onClick={() => setView(key)} className={`border-b-2 px-3 py-2 text-sm font-medium focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-600 ${view === key ? "border-emerald-600 text-emerald-700 dark:text-emerald-400" : "border-transparent text-slate-500 hover:text-slate-800 dark:hover:text-slate-200"}`}>
+              {label}
+            </button>
+          ))}
+        </nav>
+      </section>
+
+      <div id="repository-view-panel" role="tabpanel" aria-labelledby={`repository-tab-${view}`} tabIndex={0} className="flex flex-col gap-6 focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-600">
+        {view === "pulls" && canLoad ? <div className="mt-4 flex flex-wrap items-center gap-3">
+          <ListOptions idPrefix="pulls" state={prState} onStateChange={(next) => { setPrState(next); setPage(1); }} perPage={prPerPage} onPerPageChange={(next) => { setPrPerPage(next); setPage(1); }} />
+          {maintainerQueue ? <span className="inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-200">Queue: {maintainerQueue === "needsReview" ? "Review requested" : maintainerQueue === "needsChanges" ? "Formal changes requested" : "Checks pending"}<button type="button" className="font-semibold hover:underline" onClick={() => setMaintainerQueue(null)}>Clear</button></span> : null}
           <button
             type="button"
             className="rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-medium hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800"
-            disabled={!canLoad || loading || !data}
-            onClick={() => void fetchPrs(page)}
+            disabled={!canLoad || loading}
+            onClick={() => void fetchPrs(page, search.trim() || undefined)}
           >
             Refresh
           </button>
           <button
             type="button"
             className="rounded-md border border-amber-600 bg-amber-50 px-4 py-2 text-sm font-medium text-amber-800 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-100 dark:hover:bg-amber-950/70"
-            disabled={!canLoad || !data?.pulls.length || reviewLoadingFor !== null || !aiMode}
+            disabled={!canLoad || !dataMatchesCurrentRepo || !data?.pulls.length || reviewLoadingFor !== null || !aiMode}
             onClick={() => void reviewAllOnPage()}
             title="Runs reviews sequentially; the panel will show only the last PR in the batch (v1 limitation)."
           >
             Review all on page
           </button>
-          <span className="text-xs text-slate-500">{paginationLabel}</span>
-        </div>
+          <span className="text-xs text-slate-500">{loading ? "Loading pull requests…" : paginationLabel}</span>
+        </div> : null}
 
-        {aiMode ? (
-          <div className="mt-3 flex flex-col gap-2">
+        {view === "rules" && canLoad ? (
+          <section className="flex flex-col gap-2 rounded-xl border border-slate-200 bg-white/60 p-4 dark:border-slate-800 dark:bg-slate-900/40">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
-                <span className="text-xs font-medium uppercase tracking-wide text-slate-500">Review rules</span>
+                <h2 className="text-lg font-medium">Review Rules</h2>
                 <span className="text-[10px] text-slate-400">(applied alongside built-in rules)</span>
               </div>
-              {savedRules.length > 0 ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <button type="button" className="text-xs font-medium text-emerald-700 hover:underline dark:text-emerald-400" disabled={repoRulesLoading} onClick={() => void fetchRepoRulesFromGH()}>{repoRulesLoading ? "Refreshing rules…" : "Refresh repo rules"}</button>
                 <div className="flex items-center gap-1">
                   <select
                     className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs outline-none ring-emerald-500/40 focus:ring-2 dark:border-slate-700 dark:bg-slate-950"
                     value=""
                     onChange={(e) => {
-                      const rule = savedRules.find((r) => r.name === e.target.value);
-                      if (rule) setReviewPrompt(rule.prompt);
+                      const selected = e.target.value;
+                      if (selected === "template:maintainer-review-workflow") {
+                        setReviewPrompt(MAINTAINER_REVIEW_WORKFLOW_TEMPLATE);
+                      } else {
+                        const rule = savedRules.find((r) => `saved:${r.name}` === selected);
+                        if (rule) setReviewPrompt(rule.prompt);
+                      }
                     }}
                   >
-                    <option value="" disabled>Load saved rule…</option>
+                    <option value="" disabled>Load rule or template…</option>
+                    <optgroup label="Built-in templates">
+                      <option value="template:maintainer-review-workflow">Maintainer review workflow</option>
+                    </optgroup>
+                    {savedRules.length ? <optgroup label="Saved rules">
                     {savedRules.map((r) => (
-                      <option key={r.name} value={r.name}>{r.name}</option>
+                      <option key={r.name} value={`saved:${r.name}`}>{r.name}</option>
                     ))}
+                    </optgroup> : null}
                   </select>
                 </div>
-              ) : null}
+              </div>
             </div>
             <textarea
               className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-emerald-500/40 placeholder:text-slate-400 focus:ring-2 dark:border-slate-700 dark:bg-slate-950 dark:placeholder:text-slate-600"
@@ -1735,6 +2218,14 @@ export function Dashboard() {
               value={reviewPrompt}
               onChange={(e) => setReviewPrompt(e.target.value)}
             />
+            <p className="text-xs text-slate-500">Templates load into this editable prompt. Customize it, then choose Save rule to keep a repo-specific version. Prior review-thread status is not loaded automatically; add that context when needed.</p>
+            <div>
+              <label className="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-300">
+                <input type="checkbox" checked={naturalReview} onChange={(e) => setNaturalReview(e.target.checked)} />
+                <span>Human-style, concise maintainer review</span>
+              </label>
+              <p className="ml-6 text-xs text-slate-500">Adds a model pass to tighten wording and merge duplicate findings; code references and line numbers stay anchored to the original review.</p>
+            </div>
             <div className="flex items-center gap-2">
               {showSaveInput ? (
                 <div className="flex items-center gap-1">
@@ -1785,12 +2276,12 @@ export function Dashboard() {
               ) : null}
             </div>
 
-            {/* Repo coding rules (Cursor / Claude) */}
+            {/* Repository coding rules and skills */}
             <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50/50 p-3 dark:border-slate-700 dark:bg-slate-900/30">
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-medium text-slate-600 dark:text-slate-400">
-                    Repo coding rules
+                    Repo rules and skills
                   </span>
                   {repoRulesLoading ? (
                     <span className="text-[10px] text-slate-400">Loading…</span>
@@ -1799,7 +2290,7 @@ export function Dashboard() {
                       {allRuleFiles.length} file{allRuleFiles.length > 1 ? "s" : ""} found
                     </span>
                   ) : repoRules ? (
-                    <span className="text-[10px] text-slate-400">No .cursor or .claude rules found</span>
+                    <span className="text-[10px] text-slate-400">No repository rules or skills found</span>
                   ) : null}
                   {selectedRulePaths.size > 0 && (
                     <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">
@@ -1850,11 +2341,15 @@ export function Dashboard() {
                     const isSelected = selectedRulePaths.has(rf.path);
                     const colorCls = rf.source === "cursor"
                       ? "text-cyan-600 dark:text-cyan-400"
-                      : "text-violet-600 dark:text-violet-400";
-                    const tagLabel = rf.source === "cursor" ? "Cursor" : "Claude";
+                      : rf.source === "agents"
+                        ? "text-emerald-600 dark:text-emerald-400"
+                        : "text-violet-600 dark:text-violet-400";
+                    const tagLabel = rf.source === "cursor" ? "Cursor" : rf.source === "agents" ? "Agents" : "Claude";
                     const tagCls = rf.source === "cursor"
                       ? "border-cyan-200 bg-cyan-50 text-cyan-700 dark:border-cyan-800 dark:bg-cyan-950/40 dark:text-cyan-300"
-                      : "border-violet-200 bg-violet-50 text-violet-700 dark:border-violet-800 dark:bg-violet-950/40 dark:text-violet-300";
+                      : rf.source === "agents"
+                        ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300"
+                        : "border-violet-200 bg-violet-50 text-violet-700 dark:border-violet-800 dark:bg-violet-950/40 dark:text-violet-300";
 
                     return (
                       <div key={rf.path} className="rounded-md border border-slate-200 dark:border-slate-700">
@@ -1882,17 +2377,21 @@ export function Dashboard() {
                 </div>
               )}
             </div>
-          </div>
+          </section>
         ) : null}
 
-        {error ? (
+        {view === "pulls" && canLoad && error ? (
           <p className="mt-3 rounded-md border border-rose-300 bg-rose-50 px-3 py-2 text-sm text-rose-800 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-100">
             {error}
           </p>
         ) : null}
-      </section>
+        {view === "pulls" && data && !dataMatchesCurrentRepo && canLoad ? (
+          <p role="status" className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-100">
+            Cached pull requests belong to {dataForRepo}. The pull request list will refresh for {owner}/{repo} automatically.
+          </p>
+        ) : null}
 
-      {data ? (
+        {view === "pulls" && canLoad && data && dataMatchesCurrentRepo ? (
         <section className="flex flex-col gap-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <h2 className="text-lg font-medium">Pull requests</h2>
@@ -1901,7 +2400,7 @@ export function Dashboard() {
                 type="button"
                 className="rounded-md border border-slate-300 px-3 py-1.5 text-sm hover:bg-slate-100 disabled:opacity-40 dark:border-slate-700 dark:hover:bg-slate-900"
                 disabled={page <= 1 || loading}
-                onClick={() => void fetchPrs(Math.max(1, page - 1))}
+                onClick={() => setPage((current) => Math.max(1, current - 1))}
               >
                 Prev
               </button>
@@ -1909,7 +2408,7 @@ export function Dashboard() {
                 type="button"
                 className="rounded-md border border-slate-300 px-3 py-1.5 text-sm hover:bg-slate-100 disabled:opacity-40 dark:border-slate-700 dark:hover:bg-slate-900"
                 disabled={!data.pagination.hasMore || loading}
-                onClick={() => void fetchPrs(page + 1)}
+                onClick={() => setPage((current) => current + 1)}
               >
                 Next
               </button>
@@ -1935,7 +2434,7 @@ export function Dashboard() {
                     <button
                       type="button"
                       className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
-                      onClick={() => setSearch("")}
+                      onClick={() => { setSearch(""); setPage(1); }}
                       aria-label="Clear search"
                     >
                       ×
@@ -1954,9 +2453,15 @@ export function Dashboard() {
                   <option value="all">All</option>
                   <option value="reviewReady">Review ready</option>
                   <option value="needsChanges">Needs changes</option>
-                  <option value="blocked">Blocked (failing checks)</option>
+                  <option value="blocked">Blocked (failing checks or conflict)</option>
                   <option value="waitingOnChecks">Waiting on checks</option>
                   <option value="draft">Draft</option>
+                  <option value="needsReview">Needs review</option>
+                  <option value="reviewRequested">Review requested</option>
+                  <option value="waitingOnAuthor">Waiting on author</option>
+                  <option value="approved">Approved on current head</option>
+                  <option value="checksFailing">Checks failing</option>
+                  <option value="conflict">Merge conflict</option>
                 </select>
               </label>
 
@@ -1968,9 +2473,33 @@ export function Dashboard() {
                   onChange={(e) => setPrioritySort(e.target.value as PrioritySort)}
                 >
                   <option value="updatedDesc">Recently updated</option>
-                  <option value="reviewReadyThenScore">Review ready first</option>
-                  <option value="highestReadiness">Highest readiness</option>
-                  <option value="oldestUpdated">Oldest updated</option>
+                  <option value="updatedAsc">Oldest update</option>
+                  <option value="createdDesc">Newest PRs</option>
+                  <option value="createdAsc">Oldest PRs</option>
+                  <option value="popularity">Most discussed (GitHub)</option>
+                  <option value="longRunning">Longest running (GitHub)</option>
+                  <option value="readyFirst">Ready first</option>
+                  <option value="largestDiff">Largest change set</option>
+                  <option value="smallestDiff">Smallest change set</option>
+                  <option value="mostComments">Most comments</option>
+                  <option value="mostCommits">Most commits</option>
+                  <option value="recentActivity">Recent review activity</option>
+                  <option value="oldestActivity">Oldest review activity</option>
+                  <option value="highestReadiness">Highest AI readiness</option>
+                  <option value="lowestReadiness">Lowest AI readiness</option>
+                </select>
+              </label>
+
+              <label className="flex flex-col gap-1">
+                <span className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-500">Author</span>
+                <input className="w-36 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-emerald-500/40 focus:ring-2 dark:border-slate-700 dark:bg-slate-950" placeholder="GitHub username" value={prAuthorFilter} onChange={(e) => setPrAuthorFilter(e.target.value)} />
+              </label>
+
+              <label className="flex flex-col gap-1">
+                <span className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-500">Change size</span>
+                <select className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-emerald-500/40 focus:ring-2 dark:border-slate-700 dark:bg-slate-950" value={prSizeFilter} onChange={(e) => setPrSizeFilter(e.target.value)}>
+                  <option value="">Any size</option>
+                  {(["XS", "S", "M", "L", "XL", "XXL"] as const).map((size) => <option key={size} value={size}>{size}</option>)}
                 </select>
               </label>
 
@@ -1991,19 +2520,19 @@ export function Dashboard() {
               )}
             </div>
 
-            <div className="text-xs text-slate-500">
-              Showing {pullsForTable.length} / {data.pulls.length}
+            <div className="flex flex-col items-end gap-1 text-right text-xs text-slate-500">
+              <div>{data.totalCount !== undefined ? `Showing ${pullsForTable.length} of ${data.pulls.length} loaded PRs · ${data.totalCount} total matching PRs` : `Showing ${pullsForTable.length} of ${data.pulls.length} loaded PRs`}</div>
+              {(priorityView !== "all" || reviewerFilter || prAuthorFilter || prSizeFilter || search || maintainerQueue) ? <div><span>Filters narrow the loaded page. </span><button type="button" className="text-emerald-700 hover:underline dark:text-emerald-400" onClick={() => { setPriorityView("all"); setReviewerFilter(""); setPrAuthorFilter(""); setPrSizeFilter(""); setMaintainerQueue(null); setSearch(""); setPage(1); }}>Clear filters</button></div> : null}
+              {["readyFirst", "largestDiff", "smallestDiff", "mostComments", "mostCommits", "recentActivity", "oldestActivity", "highestReadiness", "lowestReadiness"].includes(prioritySort) ? <div>Selected sort ranks this loaded page.</div> : null}
             </div>
           </div>
-
-          {metricsMode ? <MetricsPanel owner={owner.trim()} repo={repo.trim()} /> : null}
 
           <div className="overflow-x-auto rounded-xl border border-slate-200 dark:border-slate-800">
             <table className="min-w-full divide-y divide-slate-200 text-left text-sm dark:divide-slate-800">
               <thead className="bg-slate-100/80 text-xs uppercase tracking-wide text-slate-500 dark:bg-slate-900/60">
                 <tr>
                   <th className="px-3 py-2">PR</th>
-                  <th className="px-3 py-2">Score</th>
+                  <th className="px-3 py-2" title="Advisory score from the latest AI review of this PR head">AI readiness</th>
                   <th className="px-3 py-2">Status</th>
                   <th className="px-3 py-2">Mergeable</th>
                   <th className="px-3 py-2">Size</th>
@@ -2019,6 +2548,13 @@ export function Dashboard() {
                   const expanded = detailsOpenFor === p.number;
                   const gl = glanceByPr[p.number];
                   const ins = insightsByPr[p.number];
+                  const lifecycle = reviewLifecycle(p);
+                  const aiReview = reviewCache[reviewCacheKey(owner, repo, p.number, naturalReview, activeReviewProfileId, githubMcpReviewContext)];
+                  const aiScoreIsCurrent = Boolean(aiReview?.reviewedHeadSha && p.head_sha && aiReview.reviewedHeadSha === p.head_sha);
+                  const requested = [...(p.requested_reviewers ?? []).map((r) => r.login), ...(p.requested_teams ?? []).map((t) => `@${t.slug}`)];
+                  const waitingOnAuthor = lifecycle.label === "Waiting on author" || lifecycle.label === "Reviewed · author action";
+                  const nextActor = p.draft || waitingOnAuthor ? p.author || "PR author" : requested.join(", ") || (p.checks.failing > 0 ? `${p.author || "PR author"} / CI` : p.checks.pending > 0 ? "CI" : "maintainer");
+                  const ageDays = Math.max(0, Math.floor((Date.now() - Date.parse(p.created_at)) / 86400000));
 
                   return (
                     <Fragment key={p.number}>
@@ -2052,14 +2588,69 @@ export function Dashboard() {
                                 {p.author} · {p.head} → {p.base}
                                 {p.draft ? " · draft" : ""}
                               </div>
+                              <div className="mt-1">
+                                <span
+                                  title={lifecycle.title}
+                                  className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium ${
+                                    lifecycle.label.includes("Waiting")
+                                      ? "border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200"
+                                      : lifecycle.label.includes("approved")
+                                        ? "border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-200"
+                                        : lifecycle.label.includes("review") || lifecycle.label.includes("Review") || lifecycle.label.includes("Needs")
+                                          ? "border-sky-300 bg-sky-50 text-sky-800 dark:border-sky-800 dark:bg-sky-950/40 dark:text-sky-200"
+                                          : "border-violet-300 bg-violet-50 text-violet-800 dark:border-violet-800 dark:bg-violet-950/40 dark:text-violet-200"
+                                  }`}
+                                >{lifecycle.label}</span>
+                              </div>
+                              <div className="text-[11px] text-slate-500 dark:text-slate-500">opened {ageDays}d ago · next: {nextActor}</div>
+                              {p.labels && p.labels.length > 0 && (
+                                <div className="mt-1 flex flex-wrap items-center gap-1" aria-label={`Labels on pull request ${p.number}`}>
+                                  {p.labels.slice(0, 4).map((label) => (
+                                    <span
+                                      key={label.name}
+                                      title={label.description || label.name}
+                                      className="rounded-full border bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-700 dark:bg-slate-900 dark:text-slate-200"
+                                      style={{ borderColor: `#${label.color}` }}
+                                    >
+                                      {label.name}
+                                    </span>
+                                  ))}
+                                  {p.labels.length > 4 && <span className="text-[10px] text-slate-500">+{p.labels.length - 4}</span>}
+                                </div>
+                              )}
+                              {p.linkedIssues && p.linkedIssues.length > 0 && (
+                                <div className="mt-1 flex flex-wrap items-center gap-1 text-[11px]" aria-label={`Issues linked to pull request ${p.number}`}>
+                                  <span className="text-slate-500 dark:text-slate-500">Issues:</span>
+                                  {p.linkedIssues.slice(0, 3).map((issue) => (
+                                    <a
+                                      key={issue.number}
+                                      href={issue.url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      title={`${issue.title} · ${issue.state.toLowerCase()}`}
+                                      className="rounded border border-sky-200 bg-sky-50 px-1.5 py-0.5 text-sky-800 hover:underline dark:border-sky-900 dark:bg-sky-950/40 dark:text-sky-200"
+                                    >
+                                      #{issue.number}
+                                    </a>
+                                  ))}
+                                  {p.linkedIssues.length > 3 && <span className="text-slate-500">+{p.linkedIssues.length - 3}</span>}
+                                </div>
+                              )}
                             </div>
                           </div>
                         </td>
 
-                        <td className="px-3 py-3 text-center">
-                          <span className={`text-2xl font-bold ${scoreTone(p.readiness.score)}`}>
-                            {p.readiness.score}
-                          </span>
+                        <td className="px-3 py-3 text-center" title={aiReview?.mergeReadinessReason ?? "Run AI Review to assess this PR."}>
+                          {typeof aiReview?.mergeReadinessScore === "number" ? (
+                            <div className="flex flex-col items-center gap-1" aria-label={`AI readiness ${aiReview.mergeReadinessScore} out of 100${aiScoreIsCurrent ? "" : ", stale"}`}>
+                              <span className={`text-lg font-semibold ${!aiScoreIsCurrent ? "text-slate-400" : aiReview.mergeReadinessScore >= 85 ? "text-emerald-600 dark:text-emerald-400" : aiReview.mergeReadinessScore >= 65 ? "text-amber-600 dark:text-amber-300" : "text-rose-600 dark:text-rose-400"}`}>
+                                {aiReview.mergeReadinessScore}
+                              </span>
+                              <span className={`text-[10px] ${aiScoreIsCurrent ? "text-slate-500" : "text-amber-700 dark:text-amber-300"}`}>
+                                {aiScoreIsCurrent ? "AI review" : "Stale"}
+                              </span>
+                            </div>
+                          ) : <span className="text-slate-400" title="Run AI Review to get an advisory score.">—</span>}
                         </td>
 
                         <td className="px-3 py-3">
@@ -2074,30 +2665,7 @@ export function Dashboard() {
                             >
                               {ready ? "Ready" : "Not ready"}
                             </div>
-                            <div className="grid gap-0.5 text-[11px]">
-                              {p.readiness.breakdown.draftPenalty > 0 && (
-                                <div className="text-amber-700 dark:text-amber-300">−{p.readiness.breakdown.draftPenalty} draft</div>
-                              )}
-                              {p.readiness.breakdown.mergePenalty > 0 && (
-                                <div className="text-rose-700 dark:text-rose-300">−{p.readiness.breakdown.mergePenalty} merge</div>
-                              )}
-                              {p.readiness.breakdown.reviewPenalty > 0 && (
-                                <div className="text-rose-700 dark:text-rose-300">−{p.readiness.breakdown.reviewPenalty} review</div>
-                              )}
-                              {p.readiness.breakdown.checkPenalty > 0 && (
-                                <div className="text-rose-700 dark:text-rose-300">−{p.readiness.breakdown.checkPenalty} checks</div>
-                              )}
-                              {p.readiness.breakdown.approvalBonus > 0 && (
-                                <div className="text-emerald-700 dark:text-emerald-300">+{p.readiness.breakdown.approvalBonus} approval</div>
-                              )}
-                              {p.readiness.breakdown.draftPenalty === 0 &&
-                                p.readiness.breakdown.mergePenalty === 0 &&
-                                p.readiness.breakdown.reviewPenalty === 0 &&
-                                p.readiness.breakdown.checkPenalty === 0 &&
-                                p.readiness.breakdown.approvalBonus === 0 && (
-                                <div className="text-slate-500">no penalties</div>
-                              )}
-                            </div>
+                            {!ready ? <div className="text-[11px] text-slate-500">{reviewReadyReason(p)}</div> : null}
                           </div>
                         </td>
 
@@ -2194,7 +2762,7 @@ export function Dashboard() {
                             <button
                               type="button"
                               className="rounded-md border border-slate-300 px-2 py-1 text-xs font-medium hover:bg-slate-100 disabled:opacity-40 dark:border-slate-700 dark:hover:bg-slate-900"
-                              disabled={!aiMode || reviewLoadingFor === p.number}
+                              disabled={!aiMode || !dataMatchesCurrentRepo || reviewLoadingFor === p.number}
                               title={!aiMode ? "Enable AI mode to run AI review" : undefined}
                               onClick={() => void runReview(p.number)}
                             >
@@ -2233,10 +2801,7 @@ export function Dashboard() {
                               {/* Compact status bar */}
                               <div className="mb-3 flex flex-wrap items-center gap-4 text-xs text-slate-500 dark:text-slate-400">
                                 <span className="font-medium text-slate-900 dark:text-slate-100">#{p.number}</span>
-                                <span>
-                                  Readiness{" "}
-                                  <span className={ready ? "text-emerald-700 dark:text-emerald-300" : "text-amber-700 dark:text-amber-200"}>{p.readiness.score}</span>
-                                </span>
+                                <span>Status: {reviewReadyReason(p)}</span>
                                 <span>
                                   Checks{" "}
                                   <span className="text-rose-700 dark:text-rose-300">{p.checks.failing}F</span>{" "}
@@ -2349,35 +2914,102 @@ export function Dashboard() {
             </table>
           </div>
 
-          <p className="text-xs text-slate-500">
-            Changing per-page resets the selector to page 1; click Load PRs again if you want that slice
-            immediately.
-          </p>
+          <p className="text-xs text-slate-500">Changing per-page resets the list to page 1 and fetches it automatically.</p>
         </section>
       ) : null}
 
-      {reviewOpenFor !== null ? (
+      {view === "issues" && canLoad ? <IssuesInbox owner={owner.trim()} repo={repo.trim()} state={issuesState} onStateChange={setIssuesState} perPage={issuesPerPage} onPerPageChange={setIssuesPerPage} filter={issueFilter} onFilterChange={setIssueFilter} search={issueSearch} onSearchChange={setIssueSearch} author={issueAuthor} onAuthorChange={setIssueAuthor} assignee={issueAssignee} onAssigneeChange={setIssueAssignee} label={issueLabel} onLabelChange={setIssueLabel} milestone={issueMilestone} onMilestoneChange={setIssueMilestone} sort={issueSort} onSortChange={setIssueSort} /> : null}
+      {view === "milestones" && canLoad ? <MilestoneTracker owner={owner.trim()} repo={repo.trim()} state={milestonesState} onStateChange={setMilestonesState} perPage={milestonesPerPage} onPerPageChange={setMilestonesPerPage} /> : null}
+      {view === "metrics" && canLoad ? <MetricsPanel owner={owner.trim()} repo={repo.trim()} days={metricsDays} onDaysChange={setMetricsDays} /> : null}
+      {!canLoad ? <p className="rounded-xl border border-slate-200 p-6 text-center text-sm text-slate-500 dark:border-slate-800">
+        {authLoading ? "Checking GitHub sign-in…" : !user ? <>Sign in with GitHub to load repository data. <a href="/login" className="font-medium text-emerald-700 underline dark:text-emerald-400">Sign in</a></> : `Enter a GitHub repository above to load ${view === "issues" ? "its issues" : view === "milestones" ? "its milestones" : view === "rules" ? "repository review rules" : view === "metrics" ? "repository metrics" : "its pull requests"}.`}
+      </p> : null}
+      </div>
+
+      {canLoad && reviewOpenFor !== null ? (
         <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-4 sm:items-center dark:bg-black/60">
           <div className="flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl dark:border-slate-800 dark:bg-slate-950">
-            <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-800">
-              <div className="flex items-center gap-2 text-sm font-medium">
-                <span>Review for #{reviewOpenFor}</span>
-                {reviewData?.model ? <span className="text-slate-500"> · {reviewData.model}</span> : null}
-                {reviewData?.verdict ? (
-                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${(VERDICT_CONFIG[reviewData.verdict] ?? VERDICT_CONFIG.comment).cls}`}>
-                    {(VERDICT_CONFIG[reviewData.verdict] ?? VERDICT_CONFIG.comment).label}
-                  </span>
-                ) : null}
+            <div className="flex shrink-0 flex-col gap-2 border-b border-slate-200 px-4 py-3 sm:flex-row sm:items-center sm:justify-between dark:border-slate-800">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
+                  <span>Review for <a href={`https://github.com/${encodeURIComponent(owner.trim())}/${encodeURIComponent(repo.trim())}/pull/${reviewOpenFor}`} target="_blank" rel="noreferrer" className="text-emerald-700 hover:underline dark:text-emerald-400">#{reviewOpenFor}</a></span>
+                  {reviewData?.model ? <span className="text-slate-500"> · {reviewData.model}</span> : null}
+                  {reviewData?.githubMcpContextLoaded ? <span className="rounded-full border border-cyan-300 bg-cyan-50 px-2 py-0.5 text-[10px] font-medium text-cyan-800 dark:border-cyan-800 dark:bg-cyan-950/40 dark:text-cyan-200">GitHub MCP context</span> : null}
+                  {reviewData?.verdict ? (
+                    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${(VERDICT_CONFIG[reviewData.verdict] ?? VERDICT_CONFIG.comment).cls}`}>
+                      {(VERDICT_CONFIG[reviewData.verdict] ?? VERDICT_CONFIG.comment).label}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
+                  <span>Linked issues:</span>
+                  {linkedIssuesLoading ? <span>Loading…</span> : linkedIssuesError ? <span className="text-rose-600" title={linkedIssuesError}>Could not load</span> : linkedIssues.length ? linkedIssues.map((issue) => (
+                    <a key={issue.number} href={issue.url} target="_blank" rel="noreferrer" className="text-emerald-700 hover:underline dark:text-emerald-400">#{issue.number} {issue.title} · {issue.state.toLowerCase()}</a>
+                  )) : <span>None detected</span>}
+                </div>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                {reviewProviderProfiles.length ? (
+                  <label>
+                    <span className="sr-only">Model provider profile</span>
+                    <select
+                      aria-label="Model provider profile"
+                      className="max-w-40 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-700 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200"
+                      value={activeReviewProfileId}
+                      disabled={reviewLoadingFor !== null}
+                      onChange={(event) => {
+                        try {
+                          const updated = activateProviderProfile(event.target.value);
+                          setReviewProviderProfiles(updated.profiles);
+                          const profileId = updated.activeProfileId ?? "";
+                          setActiveReviewProfileId(profileId);
+                          setProviderProfileError(null);
+                          if (reviewOpenFor !== null) {
+                            const key = reviewCacheKey(owner, repo, reviewOpenFor, naturalReview, profileId, githubMcpReviewContext);
+                            let cached = reviewCache[key] ?? readPersistedReviewCacheEntry(key);
+                              if (!cached && !githubMcpReviewContext) {
+                              const legacyKey = reviewCacheKey(owner, repo, reviewOpenFor, naturalReview);
+                              const legacy = reviewCache[legacyKey] ?? readPersistedReviewCacheEntry(legacyKey);
+                              const migrated = legacyReviewForProfile(legacy, updated.profiles.find((item) => item.id === profileId));
+                              if (migrated) {
+                                cached = migrated;
+                                persistReviewCacheEntry(key, migrated);
+                                setReviewCache((current) => ({ ...current, [key]: migrated }));
+                              }
+                            }
+                            setReviewDataFor(reviewOpenFor);
+                            setReviewProfileIdFor(profileId);
+                            setReviewData(cached ?? null);
+                            setReviewError(null);
+                            setSubmitResult(null);
+                            setCommentSubmitError(null);
+                            setHiddenSeverities(new Set());
+                          }
+                        } catch (error) {
+                          setProviderProfileError(error instanceof Error ? error.message : "Could not switch provider profile");
+                        }
+                      }}
+                    >
+                      {reviewProviderProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+                    </select>
+                  </label>
+                ) : null}
+                <button
+                  type="button"
+                  className="rounded-md border border-violet-500 px-2.5 py-1 text-xs font-medium text-violet-700 hover:bg-violet-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950/40"
+                  disabled={reviewLoadingFor !== null}
+                  onClick={() => { if (reviewOpenFor !== null) void runReview(reviewOpenFor, true); }}
+                >
+                  {reviewLoadingFor !== null ? "Generating…" : "Regenerate"}
+                </button>
                 {visibleReviewComments.length ? (
                   <button
                     type="button"
                     className="rounded-md border border-emerald-500 bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-800 hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-200 dark:hover:bg-emerald-950/70"
-                    disabled={submitLoading || submitResult?.success === true}
+                    disabled={submitLoading || !commentsToSubmit.length}
                     onClick={() => void submitReviewToPr()}
                   >
-                    {submitLoading ? "Submitting…" : submitResult?.success ? "Submitted" : "Submit to PR"}
+                    {submitLoading ? "Submitting…" : commentsToSubmit.length ? "Submit to PR" : "All comments submitted"}
                   </button>
                 ) : null}
                 {reviewData ? (
@@ -2397,15 +3029,16 @@ export function Dashboard() {
                   className="rounded-md px-2 py-1 text-sm text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-900 dark:hover:text-slate-100"
                   onClick={() => {
                     setReviewOpenFor(null);
-                    setReviewData(null);
                     setHiddenSeverities(new Set());
                     setReviewError(null);
                     setSubmitResult(null);
+                    setCommentSubmitError(null);
                   }}
                 >
                   Close
                 </button>
               </div>
+              {providerProfileError ? <p role="alert" className="text-xs text-rose-600">{providerProfileError}</p> : null}
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto p-4 text-sm">
               {reviewLoadingFor !== null ? <p className="text-slate-400">Generating review…</p> : null}
@@ -2413,6 +3046,22 @@ export function Dashboard() {
                 <p className="rounded-md border border-rose-300 bg-rose-50 px-3 py-2 text-rose-800 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-100">
                   {reviewError}
                 </p>
+              ) : null}
+              {reviewData === null && reviewLoadingFor === null && !reviewError && activeReviewProfileId ? (
+                <p role="status" className="mb-3 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-slate-600 dark:border-slate-800 dark:bg-slate-900/50 dark:text-slate-300">
+                  No saved review for this provider on this PR yet. Select <span className="font-medium">Regenerate</span> to create one.
+                </p>
+              ) : null}
+              {reviewData?.warning ? (
+                <p role="status" className="mb-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100">
+                  {reviewData.warning}
+                </p>
+              ) : null}
+              {reviewData && reviewLoadingFor === null && typeof reviewData.mergeReadinessScore === "number" ? (
+                <div className="mb-3 rounded-lg border border-sky-200 bg-sky-50/60 px-3 py-2 dark:border-sky-900/60 dark:bg-sky-950/30">
+                  <div className="font-medium text-sky-900 dark:text-sky-100">AI merge readiness: {reviewData.mergeReadinessScore}/100</div>
+                  <p className="mt-0.5 text-xs text-sky-800 dark:text-sky-200">{reviewData.mergeReadinessReason} This is advisory; current GitHub checks and merge status are shown separately.</p>
+                </div>
               ) : null}
               {submitResult?.success ? (
                 <div className="mb-3 rounded-md border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-800 dark:border-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-200">
@@ -2433,16 +3082,16 @@ export function Dashboard() {
               {reviewData && reviewLoadingFor === null ? (
                 <div className="mb-4 rounded-lg border border-indigo-200 bg-indigo-50/50 p-3 dark:border-indigo-800 dark:bg-indigo-950/30">
                   <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wide text-indigo-600 dark:text-indigo-400">
-                    Main review comment (posted to PR, optional)
+                    General comment (posted with inline comments)
                   </label>
                   <textarea
                     className="w-full resize-y rounded-md border border-indigo-200 bg-white px-3 py-2 text-sm leading-relaxed text-slate-700 outline-none ring-indigo-500/40 focus:border-indigo-400 focus:ring-2 dark:border-indigo-700 dark:bg-slate-950 dark:text-slate-300"
                     rows={3}
                     placeholder="Leave empty to post only the inline comments."
-                    value={reviewData.summary}
+                    value={reviewData.generalComment ?? defaultGeneralReviewComment(reviewPullAuthor, naturalReview)}
                     onChange={(e) => {
                       setSubmitResult(null);
-                      setReviewData((prev) => prev ? { ...prev, summary: e.target.value } : prev);
+                      setReviewData((prev) => prev ? { ...prev, generalComment: e.target.value } : prev);
                     }}
                   />
                 </div>
@@ -2453,7 +3102,7 @@ export function Dashboard() {
                   summary={reviewData.summary ?? ""}
                   verdict={reviewData.verdict ?? "comment"}
                   comments={reviewData.comments}
-                  includeCommentHeading={includeCommentHeading}
+                  includeCommentHeading={includeCommentHeading && !naturalReview}
                   hiddenSeverities={hiddenSeverities}
                   onHiddenSeveritiesChange={setHiddenSeverities}
                   onUpdateSummary={(s) => { setSubmitResult(null); setReviewData((prev) => prev ? { ...prev, summary: s } : prev); }}
@@ -2464,23 +3113,27 @@ export function Dashboard() {
                       if (!prev?.comments) return prev;
                       const next = [...prev.comments];
                       next[idx] = c;
-                      return { ...prev, comments: next };
+                      return { ...prev, comments: next, submittedCommentUrls: {} };
                     });
                   }}
                   onDeleteComment={(idx) => {
                     setSubmitResult(null);
                     setReviewData((prev) => {
                       if (!prev?.comments) return prev;
-                      return { ...prev, comments: prev.comments.filter((_, i) => i !== idx) };
+                      return { ...prev, comments: prev.comments.filter((_, i) => i !== idx), submittedCommentUrls: {} };
                     });
                   }}
                   onAddComment={(c) => {
                     setSubmitResult(null);
                     setReviewData((prev) => {
                       if (!prev) return prev;
-                      return { ...prev, comments: [...(prev.comments ?? []), c] };
+                      return { ...prev, comments: [...(prev.comments ?? []), c], submittedCommentUrls: {} };
                     });
                   }}
+                  onSubmitComment={(comment, index) => void submitReviewComment(comment, index)}
+                  submittedCommentUrls={reviewData.submittedCommentUrls}
+                  submittingCommentKey={submittingCommentKey}
+                  commentSubmitError={commentSubmitError}
                 />
               ) : reviewData?.markdown ? (
                 <ReviewFallback markdown={reviewData.markdown} />
@@ -2502,13 +3155,35 @@ export function Dashboard() {
                       className="shrink-0 rounded-md bg-violet-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-violet-500 disabled:opacity-40"
                       disabled={reviewLoadingFor !== null}
                       onClick={() => {
-                        if (reviewOpenFor !== null) void runReview(reviewOpenFor);
+                        if (reviewOpenFor !== null) void runReview(reviewOpenFor, true);
                       }}
                     >
                       Re-review
                     </button>
                   </div>
                 </div>
+              ) : null}
+              {reviewData && reviewLoadingFor === null ? (
+                <div className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-slate-200 p-3 dark:border-slate-800">
+                  <p className="text-xs text-slate-500">Copy the review and resolution instructions for your coding agent.</p>
+                  <button
+                    type="button"
+                    className="shrink-0 rounded-md border border-violet-500 px-3 py-1.5 text-xs font-medium text-violet-700 hover:bg-violet-50 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950/40"
+                    onClick={() => void copyReviewToAgent()}
+                  >
+                    {fixPromptCopied ? "Copied" : "Copy to agent"}
+                  </button>
+                </div>
+              ) : null}
+              {reviewData && reviewLoadingFor === null ? (
+                <ReviewChat
+                  key={`${owner}/${repo}#${reviewOpenFor}`}
+                  owner={owner}
+                  repo={repo}
+                  number={reviewOpenFor}
+                  title={data?.pulls.find((pull) => pull.number === reviewOpenFor)?.title ?? ""}
+                  review={reviewData}
+                />
               ) : null}
             </div>
           </div>

@@ -1,6 +1,5 @@
 import { Dashboard } from "@/components/Dashboard";
 import { AiToggle } from "@/components/AiToggle";
-import { MetricsToggle } from "@/components/MetricsToggle";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { UserMenu } from "@/components/UserMenu";
 
@@ -62,7 +61,6 @@ export default function Home() {
         </div>
         <div className="flex items-center gap-2">
           <AiToggle />
-          <MetricsToggle />
           <ThemeToggle />
           <UserMenu />
         </div>

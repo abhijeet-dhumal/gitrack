@@ -18,6 +18,12 @@ spec:
         - name: gitrack
           image: quay.io/jyejare_redhat/gitrack:latest
           imagePullPolicy: Always
+          env:
+            - name: SETTINGS_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gitrack-encryption
+                  key: settings-encryption-key
           ports:
             - containerPort: 3000
               protocol: TCP

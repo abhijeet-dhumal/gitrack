@@ -1,6 +1,6 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { encrypt, decrypt } from "@/lib/crypto";
+import { encrypt, decrypt, getEncryptionSecret } from "@/lib/crypto";
 
 export const PR_SIZES = ["XS", "S", "M", "L", "XL", "XXL"] as const;
 export type PrSizeLabel = (typeof PR_SIZES)[number];
@@ -25,10 +25,6 @@ type AssignmentStore = Record<string, string>;
 const DATA_DIR = join(process.cwd(), ".data");
 const STORE_FILE = join(DATA_DIR, "assignment-rules.json");
 
-function getSecret(): string {
-    return process.env.SETTINGS_ENCRYPTION_KEY ?? "gitrack-default-key-change-me";
-}
-
 function storeKey(userId: string, owner: string, repo: string): string {
     return `${userId}:${owner}/${repo}`;
 }
@@ -52,7 +48,7 @@ export async function getRules(userId: string, owner: string, repo: string): Pro
     const encrypted = store[storeKey(userId, owner, repo)];
     if (!encrypted) return [];
     try {
-        const json = decrypt(encrypted, getSecret());
+        const json = decrypt(encrypted, getEncryptionSecret());
         return JSON.parse(json) as AssignmentRule[];
     } catch {
         return [];
@@ -61,7 +57,7 @@ export async function getRules(userId: string, owner: string, repo: string): Pro
 
 export async function saveRules(userId: string, owner: string, repo: string, rules: AssignmentRule[]): Promise<void> {
     const store = await readStore();
-    store[storeKey(userId, owner, repo)] = encrypt(JSON.stringify(rules), getSecret());
+    store[storeKey(userId, owner, repo)] = encrypt(JSON.stringify(rules), getEncryptionSecret());
     await writeStore(store);
 }
 
